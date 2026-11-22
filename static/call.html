@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mith Hera — Call Assistant</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #070303; color: #fff; font-family: system-ui, sans-serif;
+         min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .card { width: min(92vw, 420px); padding: 28px 22px; border-radius: 28px;
+          background: rgba(255,45,45,.10); border: 1px solid rgba(255,45,45,.45);
+          box-shadow: 0 0 40px rgba(255,45,45,.25); backdrop-filter: blur(12px);
+          text-align: center; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  h1 span { color: #FF2D2D; }
+  p.sub { color: #ffb3b3; margin: 0 0 18px; font-size: 14px; }
+  input { width: 100%; padding: 12px; margin: 6px 0; border-radius: 14px;
+          border: 1px solid rgba(255,255,255,.25); background: rgba(0,0,0,.4);
+          color: #fff; font-size: 16px; }
+  button { width: 100%; padding: 16px; margin-top: 12px; border: none; border-radius: 999px;
+           background: #FF2D2D; color: #fff; font-size: 19px; font-weight: 700; cursor: pointer;
+           box-shadow: 0 0 24px rgba(255,45,45,.6); }
+  button.end { background: #333; box-shadow: none; }
+  button:disabled { opacity: .5; }
+  #status { margin-top: 16px; min-height: 22px; color: #ffd2d2; font-size: 15px; }
+  #log { margin-top: 12px; text-align: left; font-size: 13px; color: #ccc;
+         max-height: 180px; overflow-y: auto; }
+  #log div { padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,.08); }
+  .hidden { display: none; }
+  .note { margin-top: 14px; font-size: 12px; color: #999; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>মিঠ হেরা <span>Call Assistant</span></h1>
+  <p class="sub" id="roleText">Internet call — AI answer korbe, Bengali-te kotha bolbe</p>
+  <div id="setup">
+    <input id="name" placeholder="Apnar naam (optional)">
+    <input id="number" placeholder="Apnar number (optional)" inputmode="tel">
+    <button id="callBtn">📞 Call koro</button>
+  </div>
+  <div id="incall" class="hidden">
+    <button id="endBtn" class="end">Call shesh koro</button>
+  </div>
+  <div id="status">Ready</div>
+  <div id="log"></div>
+  <p class="note">Kono login lagbe na. Apnar phone-er mic/speaker ekhane use hoy —<br>
+  eta ekta internet call, normal mobile dialler call na.</p>
+</div>
+<script>
+(function () {
+  // ---- G.711 mu-law (8 kHz telephony) ----
+  var MULAW_DECODE = [];
+  for (var i = 0; i < 256; i++) {
+    var u = (~i) & 0xFF, sign = (u & 0x80) ? -1 : 1;
+    var exp = (u >> 4) & 0x07, mant = u & 0x0F;
+    MULAW_DECODE.push(sign * (((0x10 + mant) << (exp + 3)) - 0x84));
+  }
+  function pcmToMulaw(samples) {
+    var out = new Uint8Array(samples.length);
+    for (var n = 0; n < samples.length; n++) {
+      var s = samples[n], sign = 0;
+      if (s < 0) { sign = 0x80; s = -s; }
+      if (s > 32635) s = 32635;
+      s += 0x84;
+      var exp = 7;
+      for (var e = 7; e >= 0; e--) { if (s & (1 << (e + 7))) { exp = e; break; } }
+      var mant = (s >> (exp + 3)) & 0x0F;
+      out[n] = (~(sign | (exp << 4) | mant)) & 0xFF;
+    }
+    return out;
+  }
+  function b64encode(bytes) {
+    var bin = "";
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  }
+  function b64decode(b64) {
+    var bin = atob(b64), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  // ---- Page setup ----
+  var parts = location.pathname.split("/").filter(Boolean);
+  var role = parts[0] === "join" ? "owner" : "caller";
+  var roomId = parts[1] || ("room-" + Math.random().toString(36).slice(2, 10));
+  if (role === "owner") {
+    document.getElementById("roleText").textContent = "Owner join — caller-er sathe kotha bolben";
+    document.getElementById("callBtn").textContent = "📞 Call dhoro";
+    document.getElementById("name").classList.add("hidden");
+    document.getElementById("number").classList.add("hidden");
+  }
+  var statusEl = document.getElementById("status");
+  var logEl = document.getElementById("log");
+  function status(t) { statusEl.textContent = t; }
+  function logLine(who, text) {
+    var d = document.createElement("div");
+    d.textContent = who + ": " + text;
+    logEl.prepend(d);
+  }
+
+  var ws = null, audioCtx = null, micStream = null, processor = null, source = null;
+  var nextPlayTime = 0, serverStt = true, serverTts = true;
+  var recog = null;
+
+  fetch("/health").then(function (r) { return r.json(); }).then(function (h) {
+    serverStt = !!h.ai.stt_available;
+    serverTts = !!h.ai.tts_available;
+    if (!serverStt) status("Browser STT use hobe (server-e key nei)");
+  }).catch(function () {});
+
+  function speakInBrowser(text) {
+    try {
+      var u = new SpeechSynthesisUtterance(text);
+      u.lang = "bn-IN";
+      var voices = speechSynthesis.getVoices();
+      var bn = voices.find(function (v) { return (v.lang || "").toLowerCase().indexOf("bn") === 0; });
+      if (bn) u.voice = bn;
+      speechSynthesis.cancel();
+      speechSynthesis.speak(u);
+    } catch (e) { logLine("AI", text); }
+  }
+
+  function startBrowserStt() {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { status("Ei browser-e speech recognition nei"); return; }
+    recog = new SR();
+    recog.lang = "bn-IN";
+    recog.continuous = true;
+    recog.interimResults = false;
+    recog.onresult = function (ev) {
+      var res = ev.results[ev.results.length - 1];
+      if (res.isFinal) {
+        var text = res[0].transcript;
+        logLine("Apni", text);
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify({ event: "transcript", text: text }));
+      }
+    };
+    recog.onerror = function () { try { recog.start(); } catch (e) {} };
+    recog.onend = function () { try { recog.start(); } catch (e) {} };
+    try { recog.start(); } catch (e) {}
+  }
+
+  function playMulaw(b64) {
+    if (!audioCtx) return;
+    var bytes = b64decode(b64);
+    var pcm = new Int16Array(bytes.length);
+    for (var i = 0; i < bytes.length; i++) pcm[i] = MULAW_DECODE[bytes[i]];
+    var buf = audioCtx.createBuffer(1, pcm.length, 8000);
+    buf.getChannelData(0).set(new Float32Array(pcm.length).map(function (_, j) { return pcm[j] / 32768; }));
+    var src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    var t = Math.max(audioCtx.currentTime, nextPlayTime);
+    src.start(t);
+    nextPlayTime = t + pcm.length / 8000;
+  }
+
+  async function startCall() {
+    document.getElementById("setup").classList.add("hidden");
+    document.getElementById("incall").classList.remove("hidden");
+    status("Connecting...");
+    try {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 8000 });
+      await audioCtx.resume();
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 8000 }
+      });
+    } catch (e) {
+      status("Mic allow korte hobe: " + e.message);
+      document.getElementById("setup").classList.remove("hidden");
+      document.getElementById("incall").classList.add("hidden");
+      return;
+    }
+    var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws/call/" + roomId + "?role=" + role);
+    ws.onopen = function () {
+      status(role === "owner" ? "Connected — caller-er sathe kotha bolun" : "Connected — AI shunche...");
+      ws.send(JSON.stringify({
+        event: "start",
+        start: {
+          callId: roomId,
+          from: (document.getElementById("number").value || "").trim(),
+          fromName: (document.getElementById("name").value || "").trim(),
+          role: role
+        }
+      }));
+      if (!serverStt && role === "caller") startBrowserStt();
+      // Mic -> mu-law -> server (1024-sample chunks = 128 ms)
+      source = audioCtx.createMediaStreamSource(micStream);
+      processor = audioCtx.createScriptProcessor(1024, 1, 1);
+      processor.onaudioprocess = function (ev) {
+        if (!ws || ws.readyState !== 1) return;
+        var input = ev.inputBuffer.getChannelData(0);
+        var pcm = new Int16Array(input.length);
+        for (var i = 0; i < input.length; i++) pcm[i] = Math.max(-32768, Math.min(32767, input[i] * 32768));
+        var mulaw = pcmToMulaw(pcm);
+        ws.send(JSON.stringify({ event: "media", media: { payload: b64encode(mulaw) } }));
+      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+    };
+    ws.onmessage = function (ev) {
+      var msg;
+      try { msg = JSON.parse(ev.data); } catch (e) { return; }
+      if (msg.event === "playAudio" && msg.media && msg.media.payload) {
+        playMulaw(msg.media.payload);
+      } else if (msg.event === "say" && msg.text) {
+        logLine("AI", msg.text);
+        speakInBrowser(msg.text);
+      } else if (msg.event === "transferred") {
+        status("Owner join koreche — AI sore gelo");
+        logLine("System", "Owner join koreche");
+      } else if (msg.event === "call-ended") {
+        status("Call shesh: " + (msg.reason || ""));
+        endCall();
+      }
+    };
+    ws.onclose = function () { status("Disconnected"); endCall(); };
+    ws.onerror = function () { status("Connection error"); };
+  }
+
+  function endCall() {
+    try { if (ws) ws.send(JSON.stringify({ event: "stop" })); } catch (e) {}
+    try { if (ws) ws.close(); } catch (e) {}
+    try { if (recog) recog.stop(); } catch (e) {}
+    try { if (speechSynthesis) speechSynthesis.cancel(); } catch (e) {}
+    try { if (processor) processor.disconnect(); } catch (e) {}
+    try { if (source) source.disconnect(); } catch (e) {}
+    try { if (micStream) micStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    document.getElementById("setup").classList.remove("hidden");
+    document.getElementById("incall").classList.add("hidden");
+  }
+
+  document.getElementById("callBtn").addEventListener("click", startCall);
+  document.getElementById("endBtn").addEventListener("click", endCall);
+})();
+</script>
+</body>
+</html>
