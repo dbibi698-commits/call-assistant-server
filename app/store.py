@@ -51,6 +51,8 @@ def create_record(call_id: str, from_number: str, from_name: str = "") -> dict:
         "recording_url": "",
         "recording_inbound_url": "",
         "recording_outbound_url": "",
+        "recording_conversation_url": "",
+        "language": "bn-IN",
         "transfer_requested": False,
         "transferred": False,
         "transfer_status": "",
@@ -93,27 +95,39 @@ def list_notifications() -> list[dict]:
 
 
 def save_recordings(call_id: str, inbound_mulaw: bytes, outbound_mulaw: bytes) -> dict:
-    """Save both legs as WAV files locally (+ Supabase when configured).
+    """Save both legs + one combined conversation.wav locally
+    (+ Supabase when configured).
 
-    Returns {'inbound': url_or_path, 'outbound': url_or_path}.
+    conversation.wav mixes caller + AI/owner into a single file, so
+    the app can play the whole call with one player — the same idea
+    as Dograh's recording router keeping one recording per call.
+    Returns {'inbound': ..., 'outbound': ..., 'conversation': ...}.
     """
     base = os.path.join(settings.RECORDINGS_DIR, call_id)
     os.makedirs(base, exist_ok=True)
     inbound_wav = audio.mulaw_to_wav_bytes(inbound_mulaw)
     outbound_wav = audio.mulaw_to_wav_bytes(outbound_mulaw)
+    conversation_wav = audio.mulaw_to_wav_bytes(
+        audio.mix_mulaw(inbound_mulaw, outbound_mulaw)
+    )
     in_path = os.path.join(base, "inbound.wav")
     out_path = os.path.join(base, "outbound.wav")
+    conv_path = os.path.join(base, "conversation.wav")
     with open(in_path, "wb") as f:
         f.write(inbound_wav)
     with open(out_path, "wb") as f:
         f.write(outbound_wav)
+    with open(conv_path, "wb") as f:
+        f.write(conversation_wav)
     urls = {
         "inbound": f"/recordings/{call_id}/inbound.wav",
         "outbound": f"/recordings/{call_id}/outbound.wav",
+        "conversation": f"/recordings/{call_id}/conversation.wav",
     }
     # Upload to Supabase Storage (best effort — local files always exist).
     if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_KEY:
-        for leg, data in (("inbound", inbound_wav), ("outbound", outbound_wav)):
+        for leg, data in (("inbound", inbound_wav), ("outbound", outbound_wav),
+                          ("conversation", conversation_wav)):
             up = _supabase_upload(
                 f"{call_id}/{leg}.wav", data, "audio/wav"
             )
@@ -123,7 +137,8 @@ def save_recordings(call_id: str, inbound_mulaw: bytes, outbound_mulaw: bytes) -
     if rec:
         rec["recording_inbound_url"] = urls["inbound"]
         rec["recording_outbound_url"] = urls["outbound"]
-        rec["recording_url"] = urls["inbound"]
+        rec["recording_conversation_url"] = urls["conversation"]
+        rec["recording_url"] = urls["conversation"]
     return urls
 
 
@@ -209,6 +224,8 @@ def _supabase_row(rec: dict) -> dict:
         "recording_url": rec["recording_url"],
         "recording_inbound_url": rec["recording_inbound_url"],
         "recording_outbound_url": rec["recording_outbound_url"],
+        "recording_conversation_url": rec.get("recording_conversation_url", ""),
+        "language": rec.get("language", "bn-IN"),
         "transfer_requested": rec["transfer_requested"],
         "transferred": rec["transferred"],
     }

@@ -210,6 +210,18 @@
       } else if (msg.event === "say" && msg.text) {
         logLine("AI", msg.text);
         speakInBrowser(msg.text);
+      } else if (msg.event === "state" && msg.state) {
+        // v2 turn-state machine: show what the AI is doing right now.
+        var stateText = {
+          greeting: "AI greet korche...",
+          listening: "AI shunche...",
+          thinking: "AI bhabche...",
+          speaking: "AI bolche...",
+          transferring: "Owner ke connect korchhi...",
+          bridged: "Owner-er sathe kotha bolun",
+          ending: "Call shesh hochche..."
+        }[msg.state] || msg.state;
+        status(stateText);
       } else if (msg.event === "transferred") {
         status("Owner join koreche — AI sore gelo");
         logLine("System", "Owner join koreche");

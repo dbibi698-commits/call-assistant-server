@@ -1,5 +1,18 @@
 """Live call sessions: the conversation loop, transfer and bridging.
 
+v2 (Dograh-pattern upgrade): the call runs as an explicit turn-state
+machine — greeting -> listening -> thinking -> speaking -> listening
+— so the caller page always shows what the AI is doing, and a turn
+never stalls. Barge-in is only confirmed after 0.15 s of sustained
+caller speech (Dograh's UserAggregator pattern), so a cough does not
+cut the greeting off. Every AI turn ends with a question or a nudge
+(Dograh's turn-taking rule), so the caller always knows it is their
+turn. Transfer has two paths: naming the owner (Murshid / Sadhin)
+transfers at once; a vague "connect koro" asks once "Apni ki owner
+er sathe kotha bolte chan?" and transfers only on yes. The AI never
+ends the call itself — only the caller ending it, a goodbye, or an
+owner-busy transfer timeout ends it.
+
 One CallSession per room (one call). Two roles can connect over the
 WebSocket, using the same JSON protocol Plivo uses for audio streams
 (start / media / stop in, playAudio / clearAudio out) so the optional
@@ -12,6 +25,7 @@ provider adapter can reuse this engine unchanged:
   Server -> caller: {"event":"playAudio","media":{"payload":"<base64 mulaw>"}}
                     {"event":"say","text":"..."}          (browser TTS fallback)
                     {"event":"clearAudio"}
+                    {"event":"state","state":"listening|thinking|speaking|..."}
                     {"event":"transferred"}               (owner joined)
                     {"event":"call-ended","reason":"..."}
 
@@ -20,13 +34,14 @@ Conversation loop (listen-first, never hangs up by itself):
   Empty STT -> "Ami thik shunte parini, arekbar bolun" and listen again.
 
 Transfer (the ONLY connection to the user's phone):
-  Caller says owner / Murshid / Sadhin / "connect koro" -> AI says
-  "Ek minute, connect korchhi", a notification + join link is created,
-  and the server waits TRANSFER_WAIT_SECONDS for the owner to open
-  /join/<room_id> and join the SAME call. If the owner joins, the AI
-  steps aside and audio is bridged caller <-> owner (server forwards
-  the frames; recording keeps running). If nobody joins, the AI tells
-  the caller the owner is busy and ends politely.
+  Caller says owner / Murshid / Sadhin -> AI says "Ek minute, connect
+  korchhi" at once; a vague "connect koro" first asks "Apni ki owner
+  er sathe kotha bolte chan?" and transfers only on yes. A notification
+  + join link is created, and the server waits TRANSFER_WAIT_SECONDS
+  for the owner to open /join/<room_id> and join the SAME call. If the
+  owner joins, the AI steps aside and audio is bridged caller <-> owner
+  (server forwards the frames; recording keeps running). If nobody
+  joins, the AI tells the caller the owner is busy and ends politely.
   No live listening, no live audio on the user's phone at any other time.
 """
 
@@ -34,6 +49,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 
 from . import ai, audio, store
@@ -48,17 +64,75 @@ SPEECH_RMS = 400.0
 SILENCE_AFTER_SPEECH_S = 1.0
 MIN_UTTERANCE_S = 0.4
 MAX_UTTERANCE_S = 12.0
+# Barge-in guard (Dograh pattern: the UserAggregator owns interruption,
+# it is only confirmed after real speech, not a noise spike). The AI
+# stops speaking only after 0.15 s of sustained caller speech.
+BARGE_IN_CONFIRM_S = 0.15
 
-TRANSFER_WORDS = [
+# Turn states (Dograh pipeline pattern: the call is always in exactly
+# one state, and the caller page shows it — "AI shunche / AI bolche").
+STATE_GREETING = "greeting"
+STATE_LISTENING = "listening"
+STATE_THINKING = "thinking"
+STATE_SPEAKING = "speaking"
+STATE_TRANSFERRING = "transferring"
+STATE_BRIDGED = "bridged"
+STATE_ENDING = "ending"
+
+# Direct transfer: the caller named the owner — transfer at once.
+DIRECT_TRANSFER_WORDS = [
     "murshid", "sadhin", "sadin", "boss", "owner",
     "মুরশিদ", "সাধিন", "সাদিন", "বস", "ওনার",
-    "connect", "কানেক্ট",
 ]
+# Ambiguous transfer: the caller wants *a* connection but did not name
+# the owner — ask once ("Apni ki owner er sathe kotha bolte chan?")
+# and transfer only on yes (Dograh handoff-confirmation pattern).
+AMBIGUOUS_TRANSFER_WORDS = [
+    "connect", "কানেক্ট", "phone ta dao", "call ta dao", "dite hobe",
+    "ফোনটা দাও", "কলটা দাও", "লাগাও",
+]
+YES_WORDS = ["হ্যাঁ", "ha", "haan", "yes", "dao", "দাও", "kor", "করো", "korun", "করুন"]
+NO_WORDS = ["না", "na", "no", "lagbe na", "লাগবে না"]
+# Goodbye: the caller ends the call politely — AI says goodbye too,
+# then ends. The AI NEVER ends the call on its own otherwise.
+# NOTE: short words ("bye", "বাই", "ha", "na") are matched as whole
+# tokens only — substring matching would false-fire ("সবাই" contains
+# "বাই", "কথা" contains "ha", "জানিনা" contains "na") and end a call
+# the caller never meant to end.
+GOODBYE_PHRASES = [
+    "goodbye", "আল্লাহ হাফেজ", "আল্লাহ হাফিজ",
+    "ফোন রাখছি", "রাখছি", "রাখলাম",
+]
+GOODBYE_TOKENS = ["bye", "বাই"]
+GOODBYE_LINE_BN = "ঠিক আছে, ধন্যবাদ। আবার কথা হবে।"
+TRANSFER_CONFIRM_BN = "আপনি কি ওনার-এর সাথে কথা বলতে চান?"
+TRANSFER_CANCEL_BN = "ঠিক আছে, তাহলে বলুন — আমি শুনছি।"
 
 
-def wants_transfer(text: str) -> bool:
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.split(r"[\s,।!?]+", text.lower()) if t]
+
+
+def _contains(text: str, words: list[str]) -> bool:
     low = text.lower()
-    return any(w in low for w in TRANSFER_WORDS)
+    return any(w in low for w in words)
+
+
+def _contains_token(text: str, words: list[str]) -> bool:
+    toks = _tokens(text)
+    return any(w in toks for w in words)
+
+
+def wants_transfer_direct(text: str) -> bool:
+    return _contains(text, DIRECT_TRANSFER_WORDS)
+
+
+def wants_transfer_ambiguous(text: str) -> bool:
+    return _contains(text, AMBIGUOUS_TRANSFER_WORDS)
+
+
+def is_goodbye(text: str) -> bool:
+    return _contains(text, GOODBYE_PHRASES) or _contains_token(text, GOODBYE_TOKENS)
 
 
 class CallSession:
@@ -84,8 +158,18 @@ class CallSession:
         self.transfer_status = ""          # "" | "waiting" | "bridged" | "timeout"
         self.bridged = False
         self._empty_heard = 0
+        # v2 turn-state machine (Dograh pipeline pattern).
+        self.state = STATE_LISTENING
+        self._interrupt_since: float | None = None
+        self._transfer_pending = False     # asked "owner ke chaichen?" — awaiting yes/no
         self.record = store.create_record(room_id, self.caller_label)
         ROOMS[room_id] = self
+
+    async def _set_state(self, state: str):
+        """Move to a new turn state and tell the caller page about it."""
+        self.state = state
+        log.info("room=%s state=%s", self.room_id, state)
+        await self.send_caller({"event": "state", "state": state})
 
     # ------------------------------------------------------------ helpers
     def base_url(self, request_host: str = "") -> str:
@@ -118,15 +202,23 @@ class CallSession:
 
     # ------------------------------------------------------------- speech
     async def speak(self, text: str):
-        """Speak to the caller: server TTS audio, or browser TTS fallback."""
+        """Speak to the caller: server TTS audio, or browser TTS fallback.
+
+        Turn states: SPEAKING while the reply plays (or is spoken by
+        the browser), then back to LISTENING — the loop never stalls,
+        because every turn ends by listening again.
+        """
         self.transcript.append({"role": "ai", "text": text})
         self.record["transcript"] = self.transcript
+        await self._set_state(STATE_SPEAKING)
         mulaw = await asyncio.to_thread(ai.synthesise, text)
         if mulaw:
             await self._play_mulaw(mulaw)
         else:
             # No TTS key: the caller's browser speaks it (free fallback).
             await self.send_caller({"event": "say", "text": text})
+        if self.state == STATE_SPEAKING:
+            await self._set_state(STATE_LISTENING)
 
     async def _play_mulaw(self, mulaw: bytes):
         self.outbound_mulaw += mulaw
@@ -164,6 +256,7 @@ class CallSession:
 
     # --------------------------------------------------------- conversation
     async def greet(self):
+        await self._set_state(STATE_GREETING)
         await self.speak(settings.GREETING_BN)
 
     async def on_caller_audio(self, mulaw: bytes):
@@ -187,8 +280,15 @@ class CallSession:
         now = time.time()
         if rms >= SPEECH_RMS:
             if self._speaking:
-                # Barge-in: caller interrupted the AI — stop speaking.
-                await self.stop_playback()
+                # Barge-in, Dograh-style: interruption is only confirmed
+                # after sustained caller speech (0.15 s), not a cough
+                # or a noise spike cutting the greeting off mid-word.
+                if self._interrupt_since is None:
+                    self._interrupt_since = now
+                elif now - self._interrupt_since >= BARGE_IN_CONFIRM_S:
+                    self._interrupt_since = None
+                    await self.stop_playback()
+                    await self._set_state(STATE_LISTENING)
             if self._speech_started is None:
                 self._speech_started = now
                 self._buffer = bytearray()
@@ -199,6 +299,7 @@ class CallSession:
             if now - self._speech_started >= MAX_UTTERANCE_S:
                 await self._finish_utterance()
         else:
+            self._interrupt_since = None
             if self._speech_started is not None:
                 self._buffer += mulaw
                 self._buffer_pcm += pcm
@@ -222,7 +323,13 @@ class CallSession:
         await self.on_caller_text(text.strip())
 
     async def on_caller_text(self, text: str):
-        """A caller utterance, from server STT or browser STT."""
+        """A caller utterance, from server STT or browser STT.
+
+        Turn loop (Dograh pipeline pattern): LISTENING -> THINKING ->
+        SPEAKING -> LISTENING. The AI never ends the call itself —
+        only the caller ending it, a goodbye, or an owner-busy
+        transfer timeout ends it.
+        """
         if not text:
             self._empty_heard += 1
             if self._empty_heard <= 2:
@@ -231,9 +338,30 @@ class CallSession:
         self._empty_heard = 0
         self.transcript.append({"role": "caller", "text": text})
         self.record["transcript"] = self.transcript
-        if wants_transfer(text):
+        # Goodbye: caller ends politely — AI says goodbye too, then ends.
+        if is_goodbye(text):
+            await self.speak(GOODBYE_LINE_BN)
+            await self.end("caller-goodbye")
+            return
+        # Transfer confirmation: an earlier ambiguous "connect koro"
+        # asked "owner ke chaichen?" — this utterance answers it.
+        if self._transfer_pending:
+            self._transfer_pending = False
+            if _contains_token(text, YES_WORDS):
+                await self.start_transfer(text)
+                return
+            if _contains_token(text, NO_WORDS):
+                await self.speak(TRANSFER_CANCEL_BN)
+                return
+            # Neither yes nor no: treat as a normal utterance.
+        if wants_transfer_direct(text):
             await self.start_transfer(text)
             return
+        if wants_transfer_ambiguous(text):
+            self._transfer_pending = True
+            await self.speak(TRANSFER_CONFIRM_BN)
+            return
+        await self._set_state(STATE_THINKING)
         reply, _source = await asyncio.to_thread(ai.brain_reply, self.transcript, text)
         await self.speak(reply)
 
@@ -241,7 +369,9 @@ class CallSession:
     async def start_transfer(self, trigger_text: str):
         self.transfer_requested = True
         self.transfer_status = "waiting"
+        self._transfer_pending = False
         self.record["transfer_requested"] = True
+        await self._set_state(STATE_TRANSFERRING)
         store.add_notification(
             "transfer",
             f"Transfer — {self.caller_label} Murshid/Sadhin ke chaiche",
@@ -249,6 +379,7 @@ class CallSession:
             body=f"Join korte tap koro: {self.join_url}  |  Caller boleche: {trigger_text}",
         )
         await self.speak(settings.TRANSFER_LINE_BN)
+        await self._set_state(STATE_TRANSFERRING)
         # Wait for the owner to join; the join handler flips the flag.
         for _ in range(int(settings.TRANSFER_WAIT_SECONDS * 5)):
             if self.bridged:
@@ -265,6 +396,7 @@ class CallSession:
         self.transfer_status = "bridged"
         self.record["transferred"] = True
         await self.stop_playback()
+        await self._set_state(STATE_BRIDGED)
         await self.send_caller({"event": "transferred"})
         await self.send_owner(
             {"event": "say", "text": "Owner join koreche. Caller-er sathe kotha bolun."}
@@ -286,6 +418,7 @@ class CallSession:
 
     # -------------------------------------------------------------- ending
     async def end(self, reason: str = "ended"):
+        await self._set_state(STATE_ENDING)
         await self.send_caller({"event": "call-ended", "reason": reason})
         await self.send_owner({"event": "call-ended", "reason": reason})
         await self.finalize()
@@ -296,6 +429,8 @@ class CallSession:
         self._finalized = True
         self.record["summary"] = await asyncio.to_thread(ai.summarise_call, self.transcript)
         self.record["transfer_status"] = self.transfer_status
+        self.record["turn_state"] = self.state
+        self.record["language"] = "bn-IN"
         store.save_recordings(
             self.room_id, bytes(self.inbound_mulaw), bytes(self.outbound_mulaw)
         )

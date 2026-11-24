@@ -81,6 +81,15 @@ def health():
     return {
         "ok": True,
         "service": "mith-hera-call-assistant-server",
+        "version": "2.0-dograh-patterns",
+        "pipeline": (
+            "turn-state machine (greeting/listening/thinking/speaking), "
+            "barge-in guard 0.15s, transfer confirmation, combined "
+            "conversation.wav recording — patterns from Dograh "
+            "(github.com/dograh-hq/dograh, BSD-2), reimplemented here "
+            "in this lightweight server; Dograh itself is NOT running "
+            "here (it needs 9 Docker services, far beyond Render free)"
+        ),
         "ai": ai.status(),
         "supabase": store.supabase_configured(),
         "owner_phone_set": bool(settings.OWNER_PHONE),
@@ -135,8 +144,8 @@ def list_notifications():
 
 @app.get("/recordings/{call_id}/{leg}.wav")
 def get_recording(call_id: str, leg: str):
-    if leg not in ("inbound", "outbound"):
-        return JSONResponse({"error": "leg must be inbound or outbound"}, status_code=400)
+    if leg not in ("inbound", "outbound", "conversation"):
+        return JSONResponse({"error": "leg must be inbound, outbound or conversation"}, status_code=400)
     path = os.path.join(settings.RECORDINGS_DIR, call_id, f"{leg}.wav")
     if not os.path.exists(path):
         return JSONResponse({"error": "recording not found"}, status_code=404)

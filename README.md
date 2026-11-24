@@ -1,144 +1,199 @@
-# Mith Hera Call Assistant — Server
+# Mith Hera Call Assistant — Server v2 (Dograh-pattern upgrade)
 
 Own free server. **No Plivo, no Twilio, no paid telephony provider.**
 Calls come in over the internet (WebRTC page) straight to this server.
 The server AI answers in Bengali, listens, replies, records both sides.
+The user's phone stays silent — only a notification + a recording.
+
+**Status: built and locally verified. NOT deployed.** The live server
+(https://mith-hera-call-server.onrender.com) still runs v1 until the
+user approves this version. Nothing was pushed to the live repo.
 
 ## Sotti kotha / Honest limit (please read first)
 
-**Bengali:** Ei server-e **internet call** (WebRTC) ashe — browser theke call
-korle AI answer korbe, kotha bolbe, recording save hobe. **Normal mobile
-dialler theke call korle seta server-e ashte pare na**, karon normal call-er
-jonno ekta phone number lage, ar kono code-i free-te number banate pare na.
-Dialler call chaile pore ekta number attach korte hobe (jemon Plivo trial
-number) — tokhon `ENABLE_PLIVO=true` kore provider adapter on korte hobe.
+**Bengali:** Ei server-e **internet call** (WebRTC) ashe — browser theke
+call korle AI answer korbe, kotha bolbe, recording save hobe. **Normal
+mobile dialler theke call korle seta server-e ashte pare na**, karon
+normal call-er jonno ekta phone number lage, ar kono code-i free-te
+number banate pare na. Dialler call chaile pore ekta number (Plivo
+trial ba onno provider) attach korte hobe.
 
-**English:** This server answers **internet (WebRTC) calls** from a browser.
-A normal mobile-dialler call cannot reach a server on its own — a normal
-call needs a phone number from a carrier/provider, and no code can create
-one for free. Dialler calls need a number attached later.
+**English:** this server answers internet (WebRTC) calls from a
+browser. A normal mobile-dialler call cannot reach a server on its
+own — it needs a phone number from a carrier/provider, and no code
+can create one for free.
 
-## What works free, right now
+## What Dograh is, and what v2 took from it
 
-1. **Caller** opens the call link (`/call/<id>`), taps **Call koro**, talks.
-   The server AI answers immediately:
-   > "হ্যালো, আমি মুর্শিদের অ্যাসিস্ট্যান্ট, বলো কী হলো?"
-   then listens first, replies in Bengali to what the caller actually said,
-   never hangs up by itself.
-2. **User's phone hears NOTHING.** No speaker, no mic, no dialer, no live
-   audio on his phone — the call never touches his phone at all.
-   He only gets a notification: **"Ei phone koreche — \<number\>"** with
-   time + summary (see `GET /notifications`, stored in Supabase too).
-3. **Recording of EVERY call is saved safely, server-side, both sides**
-   (`recordings/<call-id>/inbound.wav` + `outbound.wav`), uploaded to the
-   Supabase `call-recordings` bucket when configured, never deleted,
-   playable later from CHATS call history with transcript + summary
-   (`GET /calls`, `GET /calls/<id>`).
-4. **Transfer — the ONLY connection to the user's phone.** Caller says
-   "owner ke dao / Murshid ke dao / Sadhin ke dao / connect koro" → AI says
-   "এক মিনিট, কানেক্ট করছি।", a notification + join link is created, and
-   the owner opens `/join/<call-id>` and joins the SAME call — AI steps
-   aside, audio is bridged caller ↔ owner. If the owner does not join in
-   30 seconds, the AI says the owner is busy and ends politely.
-   No other connection to his phone exists — no live listening, no live
-   audio, nothing.
+Dograh (https://github.com/dograh-hq/dograh, 6,253 stars, BSD-2-Clause
+licence, Copyright 2025 Zansat Technologies) is the best open-source
+self-hosted Vapi/Retell alternative found in the research
+(`~/workspace/research_notes/github-open-source-call-assistant-20261124-0635/report.md`).
+It is a full voice-AI platform built on a Pipecat fork: visual
+workflow builder, inbound + outbound calls, human handoff/transfer,
+telephony via Twilio/Vonage/Telnyx/Plivo/Vobiz/Cloudonix/Asterisk ARI,
+BYOK/local LLM, one Docker command.
 
-## Architecture
+**Dograh itself does NOT run here — only its patterns were used.**
+Its `docker-compose.yaml` starts **9 services**: postgres (pgvector
+pg17), redis, minio, dograh-init, nginx, coturn, api, ui, cloudflared.
+Render's free tier is a **single web service with 512 MB RAM that
+sleeps after 15 min idle** — it cannot run Postgres + Redis + MinIO +
+a Python API + a Next.js UI + nginx + coturn. Dograh also needs a
+phone number from a carrier and provider API keys to do anything.
+So v2 reimplements Dograh's pipeline *patterns* inside this existing
+lightweight FastAPI server (one process, stdlib audio, no database),
+which already runs fine on Render free. No Dograh code was copied
+into this repo; the patterns below were reimplemented from scratch.
 
-```
-Caller browser (/call) ──WebSocket──> FastAPI server ──> Gemini 3.5-flash chain
-   mu-law 8 kHz audio      /ws/call/<id>      (brain, env key only)
-   (or browser STT/TTS     listen-first loop  Google Cloud STT/TTS (env key)
-    fallback, no key)      greeting + replies Sarvam Bulbul TTS (fallback)
-                                              Supabase: call_records +
-                                              call-recordings bucket
-Owner browser (/join) ──WebSocket──> same room, bridged on transfer
-```
+### Patterns taken from Dograh (concrete, with file/function names)
 
-* Brain: Gemini chain `gemini-3.5-flash → gemini-3.5-flash-lite →
-  gemini-flash-latest`, key from `GEMINI_API_KEY` only, never baked in.
-  No key → short scripted Bengali replies so a call never dies silently.
-* STT: Google Cloud Speech-to-Text (Bengali, phone_call model) → Gemini
-  audio transcription fallback → caller browser's `webkitSpeechRecognition`
-  fallback (free, no key).
-* TTS: Google Cloud TTS (`bn-IN-Standard-A`, 8 kHz → mu-law) → Sarvam
-  Bulbul fallback → caller browser's `speechSynthesis` fallback (free).
-* Audio format everywhere: mu-law 8 kHz (standard telephony).
+1. **Turn-state machine** — Dograh's pipeline is a sequence of
+   processors with explicit frames; v2 makes the same idea explicit
+   in `app/call_session.py` (`CallSession.state`,
+   `_set_state()`): every call is in exactly one state —
+   `greeting → listening → thinking → speaking → listening` —
+   and the server sends `{"event": "state", "state": ...}` so the
+   caller page shows "AI shunche / AI bolche / AI bhabche".
+2. **Turn-taking rule** — Dograh's voice-prompting guide
+   (`api/services/voice_prompting_guide/topics/turn_taking.py`):
+   *end every agent turn with a question or a clear nudge, or the
+   call stalls in dead air.* Applied in `app/ai.py`: the Bengali
+   system prompt (`SYSTEM_PROMPT_BN`, rule ৫) requires every reply
+   to end with a question, and every scripted fallback line ends
+   with an invitation ("আর কিছু বলবেন?"). Dograh's guide warns
+   against enforcing this with a regex — v2 follows that and does
+   it via the prompt only.
+3. **Barge-in guard** — Dograh lets the UserAggregator own
+   interruption frames (`should_interrupt=False` on the services in
+   `api/services/pipecat/service_factory.py`), so a noise spike
+   does not cut the agent off. v2 does the same in
+   `app/call_session.py` (`on_caller_audio`, `BARGE_IN_CONFIRM_S
+   = 0.15`): the AI stops speaking only after 0.15 s of sustained
+   caller speech.
+4. **Handoff / transfer** — Dograh transfers via a conference
+   strategy (Plivo: `PlivoConferenceStrategy` in
+   `api/services/telephony/providers/plivo/transport.py` +
+   `strategies.py`; shared `call_transfer_manager`). v2 keeps its
+   WebRTC bridge (caller ↔ owner audio forwarding) and adds the
+   handoff discipline: naming the owner (Murshid/Sadhin) transfers
+   at once; a vague "connect koro" first asks
+   "আপনি কি ওনার-এর সাথে কথা বলতে চান?" and transfers only on yes
+   (`DIRECT_TRANSFER_WORDS` / `AMBIGUOUS_TRANSFER_WORDS` /
+   `_transfer_pending` in `app/call_session.py`).
+5. **Recording router** — Dograh keeps one recording per call
+   (`RecordingRouterProcessor` in
+   `api/services/pipecat/agent_runtime_factory.py`). v2 adds the
+   same: `audio.mix_mulaw()` + `store.save_recordings()` now write
+   `conversation.wav` (both legs mixed into one file) next to
+   `inbound.wav` / `outbound.wav`, served at
+   `/recordings/<call-id>/conversation.wav`.
+6. **Plivo transport shape** — Dograh's Plivo provider is a
+   FastAPI WebSocket transport with an 8 kHz mu-law serializer and
+   auth loaded per-organisation. v1 already had that shape
+   (`/media-stream` + `/provider/plivo/*`); v2 keeps it unchanged
+   and OFF by default.
+7. **Sarvam Bengali voices** — Dograh's config
+   (`api/services/configuration/options/sarvam.py`) lists
+   `saarika:v2.5` / `saaras:v3` STT with `bn-IN` and Bulbul
+   `bulbul:v3`/`v4-flash` TTS with Bengali voices
+   (`roopa_bn_conversational`, `arnab_bn_conversation`). v2 wires
+   the same provider as its Bengali-first STT/TTS (see below).
 
-## Deploy (Render free tier)
+## Bengali-first: exactly what is wired
 
-1. Push this folder to a GitHub repo (or use Render's "New Web Service"
-   with this directory). Or use the Blueprint: `render.yaml` is included.
-2. In Render, set the environment variables (see `.env.example`):
-   `GEMINI_API_KEY` (required for smart replies),
-   `GOOGLE_API_KEY` (Speech + TTS; without it the browser fallbacks run),
-   `SUPABASE_URL`, `SUPABASE_KEY`, `SUPABASE_SERVICE_KEY` (recordings),
-   `OWNER_PHONE` (transfer label/target, E.164, e.g. +91...),
-   `BASE_URL` (the Render URL, e.g. `https://mith-hera-call-server.onrender.com`).
-3. Run `schema.sql` once in the Supabase SQL editor (creates
-   `call_records`, `call_notifications`, `call-recordings` bucket).
-4. Deploy. `GET /health` must return 200. Render free sleeps after
-   15 min idle — keep it awake with a 10-minute ping to `/health`
-   (same pattern as the Nano Reels keep-alive cron).
+**Language: bn-IN everywhere.** The greeting, every reply, the
+system prompt, the summary and the notifications are Bengali.
 
-## Try a free call (no number, no money)
+| Layer | Primary | Fallback | Needs a key? |
+|---|---|---|---|
+| Brain | Gemini, **system prompt in Bengali** (`SYSTEM_PROMPT_BN` in `app/ai.py`) — model must reply in natural Bengali, never English, end every turn with a question | Scripted Bengali replies (`SCRIPTED_ACK`) | Gemini: yes, `GEMINI_API_KEY`. Scripted: no |
+| STT (caller speech → text) | **Sarvam Saarika** `saarika:v2.5`, `language_code=bn-IN` (`stt_sarvam` in `app/ai.py`) | Google Cloud STT `bn-IN` `phone_call` model → Gemini audio transcription → caller browser STT (`webkitSpeechRecognition`, `lang=bn-IN` in `static/call.html`) | Sarvam: `SARVAM_API_KEY`. Google: `GOOGLE_API_KEY`. Gemini: `GEMINI_API_KEY`. Browser: free, no key |
+| TTS (reply → voice) | **Sarvam Bulbul** (`bulbul:v2`, speaker `roopa`; `bulbul:v4-flash` voices like `roopa_bn_conversational` available via env) (`tts_sarvam`) | Google Cloud TTS `bn-IN-Standard-A` → caller browser speech synthesis (`lang=bn-IN`, Bengali voice picked if present) | Sarvam: `SARVAM_API_KEY`. Google: `GOOGLE_API_KEY`. Browser: free, no key |
 
-1. `POST /api/rooms` → copy `call_url`.
-2. Open `call_url` in a browser (Chrome on Android works), allow mic,
-   tap **Call koro**. The AI greets in Bengali and talks with you.
-3. Say "Murshid ke dao" → the AI says "Ek minute, connect korchhi" and a
-   transfer notification appears at `GET /notifications`.
-4. Open the `join_url` in another browser tab → you join as the owner,
-   the AI steps aside, you talk to the caller directly.
-5. End the call → `GET /calls` shows the record with transcript +
-   summary, and `/recordings/<id>/inbound.wav` plays the caller's side.
+**With NO keys set** (how the live server runs today): the call
+still works — the caller's browser does STT (bn-IN) and TTS (bn-IN)
+and the brain answers with scripted Bengali lines. Nothing is ever
+answered in English; the "didn't hear" line is only spoken when the
+caller really was not heard (empty utterance), never as a rotation
+filler. `/health` lists both chains with a `configured` flag per
+step, so you can see what is actually available instead of guessing.
 
-## Normal dialler calls (later, optional, NOT free)
+**Free vs paid:** the server code, the WebRTC path, browser STT/TTS
+and scripted replies are free forever. Sarvam / Google Cloud /
+Gemini usage is billed by those providers (their free tiers and
+prices change — check their sites; nothing here hard-codes a price).
+No key is ever baked into the code — all keys are env vars only.
 
-If a real mobile number is ever wanted: rent an Indian number from Plivo
-(KYC: Udyam/GST/COI, INR account — business only), set `ENABLE_PLIVO=true`
-+ `PLIVO_AUTH_ID` / `PLIVO_AUTH_TOKEN` / `PLIVO_NUMBER`, point the Plivo
-application's Answer URL at `https://<server>/provider/plivo/voice/answer`,
-and on the owner's phone dial unconditional call forwarding once:
-`**21*<Plivo-number>#` (disable with `##21#`). Then dialler calls reach
-the Plivo number → this server → AI. The provider adapter is a thin
-layer; the AI engine is unchanged. No forwarding, no number = no dialler
-calls — that is a carrier fact, not a code gap.
+## What v2 changed vs v1 (file list)
 
-## Endpoints
+- `app/ai.py` — Bengali system prompt (`SYSTEM_PROMPT_BN`); STT
+  chain Sarvam Saarika → Google bn-IN → Gemini audio; TTS chain
+  Sarvam Bulbul → Google bn-IN; scripted fallback split so the
+  "didn't hear" line is never used for a heard utterance;
+  `status()` now reports language + both chains.
+- `app/call_session.py` — turn-state machine (`state`,
+  `_set_state()`); barge-in guard 0.15 s; transfer confirmation
+  (direct vs ambiguous); goodbye detection with whole-token matching
+  (so "সবাই" never ends a call and "কথা" never counts as "yes");
+  `turn_state` + `language` saved on the record.
+- `app/audio.py` — `mix_mulaw()` for the combined recording.
+- `app/store.py` — `conversation.wav` saved locally + uploaded to
+  Supabase when configured; record carries
+  `recording_conversation_url` + `language`.
+- `app/main.py` — `/health` reports `version:
+  2.0-dograh-patterns`; `/recordings/<id>/conversation.wav` served.
+- `app/config.py` — `SARVAM_STT_MODEL` (default `saarika:v2.5`),
+  `SARVAM_TTS_MODEL` (default `bulbul:v2`),
+  `SARVAM_STT_LANGUAGE` (default `bn-IN`).
+- `static/call.html` — shows the turn state ("AI shunche / AI
+  bolche...") from the server's `state` events. Browser STT/TTS
+  were already `bn-IN` in v1 and are unchanged.
+- `tests/smoke_test_v2.py` — new: Bengali greeting + Bengali reply
+  asserted (Bengali script), ambiguous-transfer confirmation flow,
+  direct transfer + owner-busy timeout, goodbye ending,
+  conversation.wav, `/health` chains.
+- `tests/smoke_test.py` — updated only to skip v2 `state` events.
+- `.env.example` — new Sarvam model vars documented.
 
-| Endpoint | What it does |
-|---|---|
-| `GET /` | Landing page + honest limit |
-| `GET /health` | 200 + which integrations are configured |
-| `GET /call`, `GET /call/<id>` | Caller WebRTC page (Bengali, no login) |
-| `GET /join/<id>` | Owner join page (transfer) |
-| `POST /api/rooms` | Create a room → `call_url` + `join_url` |
-| `WS /ws/call/<id>?role=caller\|owner` | Live call audio (mu-law JSON protocol) |
-| `WS /media-stream` | Same engine, Plivo-compatible path |
-| `GET /calls`, `GET /calls/<id>` | Call history (transcript + summary) |
-| `GET /notifications` | "Ei phone koreche" + transfer notifications |
-| `GET /recordings/<id>/inbound.wav` | Caller's side of a call |
-| `GET /recordings/<id>/outbound.wav` | AI + owner side of a call |
-| `GET /voice/greeting` | Greeting as audio (TTS test, 503 if no key) |
-| `POST /provider/plivo/voice/*` | Optional Plivo adapter (OFF by default) |
+Unchanged and still true: hard local mute on the user's phone
+(notification + recording only); calls answered by the server even
+when the user's phone has no internet; transfer only to Murshid /
+Sadhin (never "Sadik" — grep-verified zero matches); recordings
+never deleted by the server; Plivo adapter OFF by default.
 
-## Local run
+## Run locally
 
 ```bash
-pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-# open http://localhost:8000/  — /health must return 200
-python tests/smoke_test.py   # starts the server, checks endpoints + WS
+cd call-assistant-server-v2
+python3 -m venv .venv        # only if .venv is not already here
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+# then open http://127.0.0.1:8000/call
 ```
 
-## Files
+No keys needed to try it: the no-key path (browser STT/TTS +
+scripted Bengali replies) works out of the box.
 
-- `app/main.py` — FastAPI app, pages, WS, optional Plivo adapter
-- `app/call_session.py` — conversation loop, transfer, bridging, recording
-- `app/ai.py` — Gemini chain, STT, TTS (with fallbacks)
-- `app/audio.py` — mu-law encode/decode, WAV
-- `app/store.py` — records, notifications, Supabase
-- `app/config.py` — env-only config, no secrets in code
-- `static/call.html` — WebRTC call page (caller + owner)
-- `schema.sql`, `render.yaml`, `.env.example`, `requirements.txt`
+## Tests (both suites pass)
+
+```bash
+.venv/bin/python tests/smoke_test.py      # v1 suite, v2-compatible
+.venv/bin/python tests/smoke_test_v2.py   # v2: Bengali, transfer, goodbye
+```
+
+## Deploy (ONLY after the user approves)
+
+1. User approves this version in chat.
+2. Copy the v2 files over the live repo
+   (`dbibi698-commits/call-assistant-server`, branch `main`) —
+   same Render Blueprint (`render.yaml`, free plan, unchanged).
+3. Render redeploys automatically; check `/health` shows
+   `version: 2.0-dograh-patterns`.
+4. Env vars on Render stay as they are today (only `OWNER_PHONE`
+   is set). To get smart Bengali replies, set `GEMINI_API_KEY` in
+   the Render dashboard (never in chat, never in code). For server
+   Bengali STT/TTS, set `SARVAM_API_KEY` (or `GOOGLE_API_KEY`).
+
+Do NOT deploy on your own: the live server stays on v1 until the
+user says so.

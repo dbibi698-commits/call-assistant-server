@@ -40,6 +40,12 @@ class Settings:
     # Google Cloud TTS is not configured or returns an error.
     SARVAM_API_KEY: str = _env("SARVAM_API_KEY")
     SARVAM_SPEAKER: str = _env("SARVAM_SPEAKER", "roopa")
+    # Sarvam models (Dograh lists bulbul:v3/v4-flash + saarika:v2.5 /
+    # saaras:v3; v2 defaults kept because they match the Sarvam REST
+    # API shape this server uses — override by env if needed).
+    SARVAM_TTS_MODEL: str = _env("SARVAM_TTS_MODEL", "bulbul:v2")
+    SARVAM_STT_MODEL: str = _env("SARVAM_STT_MODEL", "saarika:v2.5")
+    SARVAM_STT_LANGUAGE: str = _env("SARVAM_STT_LANGUAGE", "bn-IN")
 
     # --- Supabase — recording + transcript storage for the app's CHATS. ---
     SUPABASE_URL: str = _env("SUPABASE_URL")

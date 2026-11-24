@@ -104,3 +104,24 @@ def resample_pcm16_linear(pcm: bytes, from_rate: int, to_rate: int = SAMPLE_RATE
         s1 = samples[min(j + 1, n - 1)]
         out += struct.pack("<h", int(s0 + (s1 - s0) * frac))
     return bytes(out)
+
+
+def mix_mulaw(a: bytes, b: bytes) -> bytes:
+    """Mix two mu-law 8 kHz streams into one (for conversation.wav).
+
+    Both legs of a call in a single file, like Dograh's recording
+    router keeps one combined recording per call. The shorter leg is
+    padded with silence; each leg is halved first so the mix cannot
+    clip.
+    """
+    pa = mulaw_to_pcm16(a)
+    pb = mulaw_to_pcm16(b)
+    na, nb = len(pa) // 2, len(pb) // 2
+    n = max(na, nb)
+    sa = struct.unpack("<%dh" % na, pa[: na * 2]) if na else ()
+    sb = struct.unpack("<%dh" % nb, pb[: nb * 2]) if nb else ()
+    out = bytearray()
+    for i in range(n):
+        x = (sa[i] if i < na else 0) // 2 + (sb[i] if i < nb else 0) // 2
+        out += struct.pack("<h", max(-32768, min(32767, x)))
+    return pcm16_to_mulaw(bytes(out))

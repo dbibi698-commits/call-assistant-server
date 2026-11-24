@@ -44,7 +44,11 @@ async def ws_call_test():
             "start": {"callId": room, "from": "+919999999999", "fromName": "Smoke Test"},
         }))
         # Greeting must arrive (as "say" — no TTS key in this test).
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        # v2 also sends "state" events first; skip those.
+        for _ in range(5):
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if msg.get("event") == "say":
+                break
         check("WS greeting event", msg.get("event") == "say",
               f"got {msg.get('event')}")
         check("WS greeting text",
@@ -52,13 +56,19 @@ async def ws_call_test():
               f"got {msg.get('text', '')[:60]}")
         # Caller speaks (browser-STT text path) -> AI must reply.
         await ws.send(json.dumps({"event": "transcript", "text": "hello, ke bolche?"}))
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+        for _ in range(5):
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+            if msg.get("event") == "say":
+                break
         check("WS reply event", msg.get("event") == "say",
               f"got {msg.get('event')}")
         check("WS reply has text", bool(msg.get("text")), "")
-        # End the call.
+        # End the call. (v2 sends a "state" event before "call-ended".)
         await ws.send(json.dumps({"event": "stop"}))
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        for _ in range(5):
+            msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+            if msg.get("event") == "call-ended":
+                break
         check("WS call-ended", msg.get("event") == "call-ended",
               f"got {msg.get('event')}")
 
