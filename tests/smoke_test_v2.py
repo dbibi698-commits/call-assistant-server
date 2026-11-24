@@ -1,10 +1,10 @@
-"""Smoke test for the Mith Hera Call Assistant server v2
-(Dograh-pattern upgrade, Bengali-first).
+"""Smoke test for the Mith Hera Call Assistant server v2.1
+(Dograh-pattern upgrade, Bengali-first, name-before-transfer).
 
 Starts the server locally (no API keys — the honest no-key path),
 then checks everything the v1 smoke test checked, plus the v2
 behaviour:
-  * /health reports version 2.0-dograh-patterns, language bn-IN, and
+  * /health reports version 2.1-name-first-transfer, language bn-IN, and
     the Bengali STT/TTS chains (Sarvam Saarika first, Google second,
     browser fallback always configured)
   * a WebSocket call gets a Bengali greeting and a Bengali reply
@@ -19,6 +19,14 @@ behaviour:
   * a combined conversation.wav recording is created and the record
     carries language bn-IN
   * the optional Plivo adapter is OFF (404) by default
+  * v2.1 NAME FIRST: a direct transfer with NO name known asks
+    "ট্রান্সফার করার আগে আপনার নামটা বলুন?" first, then transfers
+    with the name ("এক মিনিট, রহিম — কানেক্ট করছি।") and the
+    transfer notification carries that name; a transfer WITH a name
+    already known transfers at once with no name question; a caller
+    who refuses the name twice still gets transferred, with the name
+    "Naam dey ni"; the name is also asked once, early, after the
+    greeting when it is still unknown
 
 Usage:  python tests/smoke_test_v2.py
 """
@@ -156,6 +164,168 @@ async def ws_direct_transfer_timeout_test():
               f"got {msg.get('reason')}")
 
 
+async def ws_name_before_transfer_test():
+    """v2.1 (a): direct transfer with NO name known -> the AI asks
+    for the name FIRST, then transfers WITH the name, and the
+    transfer notification carries it."""
+    import websockets
+
+    room = "v2-room-name-first"
+    async with websockets.connect(f"ws://127.0.0.1:8124/ws/call/{room}?role=caller") as caller:
+        await caller.send(json.dumps({
+            "event": "start",
+            "start": {"callId": room, "from": "+915555555555"},
+        }))
+        # Greeting first, then the early name ask (name unknown).
+        msg = await recv_until(caller, lambda m: m.get("event") == "say")
+        check("v2.1 greeting is Bengali",
+              is_bengali(msg.get("text", "")) and "মুর্শিদের অ্যাসিস্ট্যান্ট" in msg["text"],
+              f"got {msg.get('text', '')[:60]}")
+        msg = await recv_until(caller, lambda m: m.get("event") == "say")
+        check("v2.1 early name ask after greeting",
+              "নামটা কী" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        # Caller asks for a transfer instead of giving the name:
+        # the AI must ask for the name BEFORE transferring.
+        await caller.send(json.dumps({"event": "transcript", "text": "Murshid ke dao"}))
+        msg = await recv_until(caller, lambda m: m.get("event") == "say")
+        check("v2.1 transfer asks name first",
+              "ট্রান্সফার করার আগে" in msg.get("text", "")
+              and "নামটা বলুন" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        # Caller gives the name -> transfer line WITH the name.
+        await caller.send(json.dumps({"event": "transcript", "text": "আমি রহিম"}))
+        msg = await recv_until(caller, lambda m: m.get("event") == "say")
+        check("v2.1 transfer line carries the name",
+              "রহিম" in msg.get("text", "") and "কানেক্ট করছি" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        # The transfer notification must carry the name too.
+        r = requests.get(f"{BASE}/notifications", timeout=5)
+        notes = [n for n in r.json()["notifications"]
+                 if n.get("kind") == "transfer" and n.get("call_id") == room]
+        check("v2.1 transfer notification carries the name",
+              bool(notes) and notes[0].get("caller_name") == "রহিম"
+              and "রহিম" in notes[0].get("title", ""),
+              f"got {notes}")
+        # Owner joins the SAME call.
+        async with websockets.connect(
+                f"ws://127.0.0.1:8124/ws/call/{room}?role=owner") as owner:
+            await owner.send(json.dumps({
+                "event": "start",
+                "start": {"callId": room, "from": "owner"},
+            }))
+            msg = await recv_until(caller, lambda m: m.get("event") == "transferred",
+                                   timeout=10)
+            check("v2.1 name-first caller sees transferred",
+                  msg.get("event") == "transferred", "")
+            await caller.send(json.dumps({"event": "stop"}))
+            msg = await recv_until(caller, lambda m: m.get("event") == "call-ended",
+                                   timeout=10)
+            check("v2.1 name-first call-ended", msg.get("event") == "call-ended", "")
+        r = requests.get(f"{BASE}/calls/{room}", timeout=5)
+        rec = r.json()
+        check("v2.1 record from_name is the given name",
+              rec.get("from_name") == "রহিম", rec.get("from_name", ""))
+        check("v2.1 record transferred", rec.get("transferred") is True, "")
+        check("v2.1 record transfer_status bridged",
+              rec.get("transfer_status") == "bridged", rec.get("transfer_status", ""))
+
+
+async def ws_transfer_with_name_test():
+    """v2.1 (b): transfer WITH a name already known -> transfers at
+    once, no name question, line carries the name."""
+    import websockets
+
+    room = "v2-room-with-name"
+    async with websockets.connect(f"ws://127.0.0.1:8124/ws/call/{room}?role=caller") as caller:
+        await caller.send(json.dumps({
+            "event": "start",
+            "start": {"callId": room, "from": "+914444444444", "fromName": "Anika"},
+        }))
+        await recv_until(caller, lambda m: m.get("event") == "say")  # greeting
+        # No early name ask (name already known) — the next "say"
+        # after the transfer request must be the transfer line itself.
+        await caller.send(json.dumps({"event": "transcript", "text": "Sadhin ke dao"}))
+        msg = await recv_until(caller, lambda m: m.get("event") == "say", timeout=10)
+        check("v2.1 known-name transfer line at once",
+              "Anika" in msg.get("text", "") and "কানেক্ট করছি" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        check("v2.1 known-name transfer asks no name question",
+              "নামটা বলুন" not in msg.get("text", ""), "")
+        r = requests.get(f"{BASE}/notifications", timeout=5)
+        notes = [n for n in r.json()["notifications"]
+                 if n.get("kind") == "transfer" and n.get("call_id") == room]
+        check("v2.1 known-name notification carries the name",
+              bool(notes) and notes[0].get("caller_name") == "Anika",
+              f"got {notes}")
+        async with websockets.connect(
+                f"ws://127.0.0.1:8124/ws/call/{room}?role=owner") as owner:
+            await owner.send(json.dumps({
+                "event": "start",
+                "start": {"callId": room, "from": "owner"},
+            }))
+            msg = await recv_until(caller, lambda m: m.get("event") == "transferred",
+                                   timeout=10)
+            check("v2.1 known-name caller sees transferred",
+                  msg.get("event") == "transferred", "")
+            await caller.send(json.dumps({"event": "stop"}))
+            msg = await recv_until(caller, lambda m: m.get("event") == "call-ended",
+                                   timeout=10)
+            check("v2.1 known-name call-ended", msg.get("event") == "call-ended", "")
+        r = requests.get(f"{BASE}/calls/{room}", timeout=5)
+        check("v2.1 known-name record from_name",
+              r.json().get("from_name") == "Anika", r.json().get("from_name", ""))
+
+
+async def ws_name_refusal_test():
+    """v2.1 (c): caller refuses the name twice -> transfer STILL
+    happens, with the name 'Naam dey ni' — never blocked forever."""
+    import websockets
+
+    room = "v2-room-name-refused"
+    async with websockets.connect(f"ws://127.0.0.1:8124/ws/call/{room}?role=caller") as ws:
+        await ws.send(json.dumps({
+            "event": "start",
+            "start": {"callId": room, "from": "+913333333333"},
+        }))
+        await recv_until(ws, lambda m: m.get("event") == "say")  # greeting
+        await recv_until(ws, lambda m: m.get("event") == "say")  # early name ask
+        await ws.send(json.dumps({"event": "transcript", "text": "Murshid ke dao"}))
+        msg = await recv_until(ws, lambda m: m.get("event") == "say")
+        check("v2.1 refusal test asks name first",
+              "ট্রান্সফার করার আগে" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        # First refusal -> asked once more.
+        await ws.send(json.dumps({"event": "transcript", "text": "নাম বলবো না"}))
+        msg = await recv_until(ws, lambda m: m.get("event") == "say")
+        check("v2.1 first refusal asks once more",
+              "নামটা" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        # Second refusal -> transfer anyway, plain line, no name.
+        await ws.send(json.dumps({"event": "transcript", "text": "না"}))
+        msg = await recv_until(ws, lambda m: m.get("event") == "say")
+        check("v2.1 second refusal still transfers",
+              "কানেক্ট করছি" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        r = requests.get(f"{BASE}/notifications", timeout=5)
+        notes = [n for n in r.json()["notifications"]
+                 if n.get("kind") == "transfer" and n.get("call_id") == room]
+        check("v2.1 refusal notification name is 'Naam dey ni'",
+              bool(notes) and notes[0].get("caller_name") == "Naam dey ni",
+              f"got {notes}")
+        # Nobody joins: owner-busy line, then the call ends politely.
+        msg = await recv_until(ws, lambda m: m.get("event") == "say", timeout=15)
+        check("v2.1 refusal owner-busy line", "ব্যস্ত" in msg.get("text", ""),
+              f"got {msg.get('text', '')[:60]}")
+        msg = await recv_until(ws, lambda m: m.get("event") == "call-ended", timeout=10)
+        check("v2.1 refusal owner-busy call-ended",
+              msg.get("reason") == "owner-busy", f"got {msg.get('reason')}")
+        r = requests.get(f"{BASE}/calls/{room}", timeout=5)
+        check("v2.1 refusal record from_name",
+              r.json().get("from_name") == "Naam dey ni",
+              r.json().get("from_name", ""))
+
+
 async def ws_goodbye_test():
     import websockets
 
@@ -199,8 +369,8 @@ def main():
         r = requests.get(f"{BASE}/health", timeout=5)
         check("GET /health 200", r.status_code == 200, r.text[:120])
         h = r.json()
-        check("health version 2.0-dograh-patterns",
-              h.get("version") == "2.0-dograh-patterns", h.get("version", ""))
+        check("health version 2.1-name-first-transfer",
+              h.get("version") == "2.1-name-first-transfer", h.get("version", ""))
         check("health language bn-IN", h["ai"].get("language") == "bn-IN", "")
         check("health STT chain starts with Sarvam Saarika",
               h["ai"]["stt_chain"][0]["provider"] == "sarvam-saarika", "")
@@ -228,6 +398,9 @@ def main():
         asyncio.run(ws_basic_bengali_test())
         asyncio.run(ws_transfer_confirm_test())
         asyncio.run(ws_direct_transfer_timeout_test())
+        asyncio.run(ws_name_before_transfer_test())
+        asyncio.run(ws_transfer_with_name_test())
+        asyncio.run(ws_name_refusal_test())
         asyncio.run(ws_goodbye_test())
 
         # Recordings: both legs + combined conversation.wav.

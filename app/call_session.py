@@ -34,15 +34,27 @@ Conversation loop (listen-first, never hangs up by itself):
   Empty STT -> "Ami thik shunte parini, arekbar bolun" and listen again.
 
 Transfer (the ONLY connection to the user's phone):
-  Caller says owner / Murshid / Sadhin -> AI says "Ek minute, connect
-  korchhi" at once; a vague "connect koro" first asks "Apni ki owner
-  er sathe kotha bolte chan?" and transfers only on yes. A notification
-  + join link is created, and the server waits TRANSFER_WAIT_SECONDS
-  for the owner to open /join/<room_id> and join the SAME call. If the
-  owner joins, the AI steps aside and audio is bridged caller <-> owner
-  (server forwards the frames; recording keeps running). If nobody
-  joins, the AI tells the caller the owner is busy and ends politely.
+  Caller says owner / Murshid / Sadhin -> the AI takes the CALLER'S
+  NAME FIRST (v2.1: "ট্রান্সফার করার আগে আপনার নামটা বলুন?"), and
+  only then says "এক মিনিট, <name> — কানেক্ট করছি" and transfers.
+  If the caller refuses the name twice (or stays silent twice) the
+  transfer still happens, with the name "Naam dey ni" — the transfer
+  is never blocked forever, and the call is never hung up. The
+  transfer notification carries the name, so the phone alert shows
+  WHO is calling. A notification + join link is created, and the
+  server waits TRANSFER_WAIT_SECONDS for the owner to open
+  /join/<room_id> and join the SAME call. If the owner joins, the AI
+  steps aside and audio is bridged caller <-> owner (server forwards
+  the frames; recording keeps running). If nobody joins, the AI
+  tells the caller the owner is busy and ends politely.
   No live listening, no live audio on the user's phone at any other time.
+
+Name capture (v2.1): the name is also asked ONCE, early, right after
+  the greeting ("আপনার নামটা কী, বলুন?") when the /call page did not
+  supply one — but only once, and it never blocks the conversation:
+  if the caller talks about something else instead, the AI just
+  listens and answers normally. A name given at any point is stored
+  in caller_name and used in the record, summary and notifications.
 """
 
 import asyncio
@@ -108,6 +120,72 @@ GOODBYE_LINE_BN = "ঠিক আছে, ধন্যবাদ। আবার �
 TRANSFER_CONFIRM_BN = "আপনি কি ওনার-এর সাথে কথা বলতে চান?"
 TRANSFER_CANCEL_BN = "ঠিক আছে, তাহলে বলুন — আমি শুনছি।"
 
+# v2.1 — name before transfer. The name the record/notification
+# carries when the caller would not give one (transfer still happens).
+NAME_NOT_GIVEN = "Naam dey ni"
+# Refusal to give a name, matched as phrases or as whole tokens.
+# ("না" / "na" as a token only — a name token is never "না".)
+NAME_REFUSAL_PHRASES = [
+    "নাম বলবো না", "নাম বলব না", "নাম বলতে চাই না", "নাম দেবো না",
+    "নাম দেব না", "নাম লাগবে না", "বলবো না", "বলব না",
+    "বলতে চাই না", "naam bolbo na", "bolbo na",
+    "don't want to say", "won't say",
+]
+NAME_REFUSAL_TOKENS = ["না", "na", "no"]
+# Words that prove an utterance is NOT a name (an issue/question).
+NAME_NOT_NAME_WORDS = [
+    "জানতে", "চাই", "করতে", "হয়েছে", "সমস্যা", "কেন", "কিভাবে",
+    "কখন", "কোথায়", "কী", "কি", "কেমন", "কত", "আছে", "নেই",
+]
+
+
+def _extract_name(text: str) -> str:
+    """Pull a likely name out of an utterance, or "" if none.
+
+    Handles "আমি রহিম", "আমার নাম রহিম", "রহিম বলছি" (X speaking).
+    At most 4 words — anything longer is a sentence, not a name.
+    """
+    t = (text or "").strip().strip("।.,!? ")
+    low = t.lower()
+    for suffix in (" বলছি", " bolchi", " bolchhi"):
+        if low.endswith(suffix):
+            t = t[: -len(suffix)].strip()
+            low = t.lower()
+            break
+    for prefix in ("আমার নামটা", "আমার নাম", "amar naamta", "amar naam",
+                   "amar nam", "আমি", "ami"):
+        if low.startswith(prefix):
+            t = t[len(prefix):].strip(" :—-")
+            break
+    toks = [w for w in re.split(r"[\s,।!?]+", t) if w]
+    if not toks or len(toks) > 4:
+        return ""
+    return " ".join(toks)
+
+
+def _looks_like_name(text: str) -> bool:
+    """True when the utterance is plausibly just a name."""
+    if not _extract_name(text):
+        return False
+    if wants_transfer_direct(text) or wants_transfer_ambiguous(text):
+        return False
+    if is_goodbye(text):
+        return False
+    # A yes/no ("হ্যাঁ", "না") or a greeting/thanks is an answer,
+    # not a name — never store "হ্যাঁ" as the caller's name.
+    if _contains_token(text, YES_WORDS) or _contains_token(text, NO_WORDS):
+        return False
+    if _contains_token(text, ["ধন্যবাদ", "হ্যালো", "hello", "hi"]):
+        return False
+    low = text.lower()
+    return not any(w in low for w in NAME_NOT_NAME_WORDS)
+
+
+def _is_name_refusal(text: str) -> bool:
+    return _contains(text, NAME_REFUSAL_PHRASES) or _contains_token(
+        text, NAME_REFUSAL_TOKENS
+    )
+
 
 def _tokens(text: str) -> list[str]:
     return [t for t in re.split(r"[\s,।!?]+", text.lower()) if t]
@@ -162,6 +240,16 @@ class CallSession:
         self.state = STATE_LISTENING
         self._interrupt_since: float | None = None
         self._transfer_pending = False     # asked "owner ke chaichen?" — awaiting yes/no
+        # v2.1 — name before transfer: asked for the name first and the
+        # next utterance is the answer; refusals/silence counted so a
+        # transfer is never blocked forever.
+        self._awaiting_name_for_transfer = False
+        self._name_refusals = 0
+        self._transfer_trigger = ""      # what the caller said to ask for transfer
+        # v2.1 — early name ask: asked once, right after the greeting,
+        # only when the name is still unknown; soft — never blocks.
+        self._name_asked = False
+        self._expecting_name_soft = False
         self.record = store.create_record(room_id, self.caller_label)
         ROOMS[room_id] = self
 
@@ -199,6 +287,25 @@ class CallSession:
 
     async def send_owner(self, msg: dict):
         await self._send(self.owner_ws, msg)
+
+    # --------------------------------------------------------- name (v2.1)
+    def _set_caller_name(self, name: str):
+        """Store the caller's name everywhere it shows up: the record,
+        the call label (used by the 'Ei phone koreche' notification),
+        and the transfer notification."""
+        name = (name or "").strip()
+        self.caller_name = name
+        self.record["from_name"] = name
+        if name:
+            self.caller_label = name
+
+    def _transfer_line(self) -> str:
+        """'Ek minute, <name> — connect korchhi' when the name is
+        known; the plain line when it is not (or was refused)."""
+        name = self.caller_name.strip()
+        if name and name != NAME_NOT_GIVEN:
+            return f"এক মিনিট, {name} — কানেক্ট করছি।"
+        return settings.TRANSFER_LINE_BN
 
     # ------------------------------------------------------------- speech
     async def speak(self, text: str):
@@ -258,6 +365,14 @@ class CallSession:
     async def greet(self):
         await self._set_state(STATE_GREETING)
         await self.speak(settings.GREETING_BN)
+        # v2.1: ask the caller's name ONCE, right after the greeting,
+        # only when it is still unknown (the /call page did not supply
+        # one). Soft ask — if the caller talks about something else
+        # instead, the conversation just goes on normally.
+        if not self.caller_name.strip() and not self._name_asked:
+            self._name_asked = True
+            self._expecting_name_soft = True
+            await self.speak(settings.NAME_ASK_BN)
 
     async def on_caller_audio(self, mulaw: bytes):
         """One ~20 ms mu-law frame from the caller."""
@@ -329,9 +444,25 @@ class CallSession:
         SPEAKING -> LISTENING. The AI never ends the call itself —
         only the caller ending it, a goodbye, or an owner-busy
         transfer timeout ends it.
+
+        v2.1 name handling, in order:
+        * awaiting a name for transfer — the utterance IS the answer
+          (name, refusal, or something else); a transfer is never
+          blocked forever: two refusals/silences/not-a-name answers
+          transfer anyway with "Naam dey ni".
+        * soft early name ask — a name-like answer is stored and
+          acknowledged; anything else just continues the conversation.
         """
         if not text:
             self._empty_heard += 1
+            # Silence while waiting for a name counts as a refusal:
+            # two of them and the transfer goes ahead anyway.
+            if self._awaiting_name_for_transfer:
+                self._name_refusals += 1
+                if self._name_refusals >= 2:
+                    self._set_caller_name(NAME_NOT_GIVEN)
+                    await self._do_transfer("")
+                    return
             if self._empty_heard <= 2:
                 await self.speak(settings.NOT_HEARD_LINE_BN)
             return
@@ -339,9 +470,35 @@ class CallSession:
         self.transcript.append({"role": "caller", "text": text})
         self.record["transcript"] = self.transcript
         # Goodbye: caller ends politely — AI says goodbye too, then ends.
+        # (Wins even while a name is being awaited.)
         if is_goodbye(text):
             await self.speak(GOODBYE_LINE_BN)
             await self.end("caller-goodbye")
+            return
+        # v2.1 — awaiting a name before transfer: this utterance is
+        # the answer. Capture it, or count a refusal and retry once.
+        if self._awaiting_name_for_transfer:
+            if _is_name_refusal(text):
+                self._name_refusals += 1
+                if self._name_refusals >= 2:
+                    self._set_caller_name(NAME_NOT_GIVEN)
+                    await self._do_transfer("")
+                else:
+                    await self.speak(settings.NAME_RETRY_BN)
+                return
+            name = _extract_name(text)
+            if name and _looks_like_name(text):
+                self._set_caller_name(name)
+                await self._do_transfer("")
+                return
+            # Not a name and not a refusal (caller talked about
+            # something else): ask once more, then transfer anyway.
+            self._name_refusals += 1
+            if self._name_refusals >= 2:
+                self._set_caller_name(NAME_NOT_GIVEN)
+                await self._do_transfer("")
+            else:
+                await self.speak(settings.NAME_RETRY_BN)
             return
         # Transfer confirmation: an earlier ambiguous "connect koro"
         # asked "owner ke chaichen?" — this utterance answers it.
@@ -354,6 +511,16 @@ class CallSession:
                 await self.speak(TRANSFER_CANCEL_BN)
                 return
             # Neither yes nor no: treat as a normal utterance.
+        # v2.1 — soft early name ask: a name-like answer is stored
+        # and acknowledged; a transfer request or anything else just
+        # continues the conversation normally (flag cleared either way).
+        if self._expecting_name_soft:
+            self._expecting_name_soft = False
+            name = _extract_name(text)
+            if name and _looks_like_name(text):
+                self._set_caller_name(name)
+                await self.speak(f"ধন্যবাদ, {name}। বলুন, কী হয়েছে?")
+                return
         if wants_transfer_direct(text):
             await self.start_transfer(text)
             return
@@ -367,18 +534,43 @@ class CallSession:
 
     # ------------------------------------------------------------ transfer
     async def start_transfer(self, trigger_text: str):
+        """Begin a transfer. v2.1 — NAME FIRST: if the caller's name
+        is still unknown, do NOT transfer yet — ask for the name and
+        wait for the answer (see on_caller_text). The transfer itself
+        happens in _do_transfer, only once the name is known or the
+        caller has refused it twice."""
         self.transfer_requested = True
-        self.transfer_status = "waiting"
-        self._transfer_pending = False
         self.record["transfer_requested"] = True
+        self._transfer_pending = False
+        self._transfer_trigger = trigger_text
+        if not self.caller_name.strip():
+            self._awaiting_name_for_transfer = True
+            self._name_refusals = 0
+            await self._set_state(STATE_TRANSFERRING)
+            await self.speak(settings.NAME_BEFORE_TRANSFER_BN)
+            return
+        await self._do_transfer(trigger_text)
+
+    async def _do_transfer(self, trigger_text: str):
+        """The transfer itself: notify the owner (WITH the caller
+        name, so the phone alert shows WHO is calling), say the
+        transfer line with the name, and wait for the owner to join
+        the same call via /join/<room_id>."""
+        self._awaiting_name_for_transfer = False
+        self.transfer_status = "waiting"
+        trigger_text = trigger_text or self._transfer_trigger
         await self._set_state(STATE_TRANSFERRING)
+        display = self.caller_name.strip() or self.caller_label
         store.add_notification(
             "transfer",
-            f"Transfer — {self.caller_label} Murshid/Sadhin ke chaiche",
+            f"Ei phone koreche — {display}",
             call_id=self.room_id,
-            body=f"Join korte tap koro: {self.join_url}  |  Caller boleche: {trigger_text}",
+            body=f"Transfer: {display} Murshid/Sadhin ke chaiche. "
+                 f"Join korte tap koro: {self.join_url}  |  "
+                 f"Caller boleche: {trigger_text}",
+            caller_name=display,
         )
-        await self.speak(settings.TRANSFER_LINE_BN)
+        await self.speak(self._transfer_line())
         await self._set_state(STATE_TRANSFERRING)
         # Wait for the owner to join; the join handler flips the flag.
         for _ in range(int(settings.TRANSFER_WAIT_SECONDS * 5)):

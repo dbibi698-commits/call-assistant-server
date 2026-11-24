@@ -86,6 +86,19 @@ class Settings:
         "GREETING_BN", "হ্যালো, আমি মুর্শিদের অ্যাসিস্ট্যান্ট, বলো কী হলো?"
     )
     TRANSFER_LINE_BN: str = _env("TRANSFER_LINE_BN", "এক মিনিট, কানেক্ট করছি।")
+    # v2.1 — name first: the AI takes the caller's name BEFORE a
+    # transfer (and asks once, early, if it still does not know it).
+    # The transfer line with a name is built as
+    # "এক মিনিট, <name> — কানেক্ট করছি।" in call_session.py.
+    NAME_ASK_BN: str = _env(
+        "NAME_ASK_BN", "আপনার নামটা কী, বলুন?"
+    )
+    NAME_BEFORE_TRANSFER_BN: str = _env(
+        "NAME_BEFORE_TRANSFER_BN", "ট্রান্সফার করার আগে আপনার নামটা বলুন?"
+    )
+    NAME_RETRY_BN: str = _env(
+        "NAME_RETRY_BN", "আপনার নামটা একটু বলবেন? না বললেও আমি কানেক্ট করে দেবো।"
+    )
     BUSY_LINE_BN: str = _env(
         "BUSY_LINE_BN", "ওনার এখন ব্যস্ত আছেন, একটু পরে আবার কল করুন। ধন্যবাদ।"
     )

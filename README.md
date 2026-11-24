@@ -1,13 +1,22 @@
-# Mith Hera Call Assistant — Server v2 (Dograh-pattern upgrade)
+# Mith Hera Call Assistant — Server v2.1 (name-first transfer)
 
 Own free server. **No Plivo, no Twilio, no paid telephony provider.**
 Calls come in over the internet (WebRTC page) straight to this server.
 The server AI answers in Bengali, listens, replies, records both sides.
 The user's phone stays silent — only a notification + a recording.
 
-**Status: built and locally verified. NOT deployed.** The live server
-(https://mith-hera-call-server.onrender.com) still runs v1 until the
-user approves this version. Nothing was pushed to the live repo.
+**Status: v2.1 built and locally verified. NOT deployed.** The live
+server (https://mith-hera-call-server.onrender.com) still runs v2
+until the user approves this version. Nothing was pushed to the live
+repo.
+
+**v2.1 change:** the AI takes the caller's name FIRST, then
+transfers — a caller who asks for Murshid/Sadhin is asked
+"ট্রান্সফার করার আগে আপনার নামটা বলুন?" and the transfer line
+becomes "এক মিনিট, <name> — কানেক্ট করছি।"; the transfer
+notification carries the name so the phone alert shows WHO is
+calling. Refusing the name twice still transfers ("Naam dey ni").
+The name is also asked once, early, after the greeting.
 
 ## Sotti kotha / Honest limit (please read first)
 
@@ -137,30 +146,45 @@ No key is ever baked into the code — all keys are env vars only.
   (direct vs ambiguous); goodbye detection with whole-token matching
   (so "সবাই" never ends a call and "কথা" never counts as "yes");
   `turn_state` + `language` saved on the record.
+  **v2.1 — name before transfer:** `_set_caller_name()`,
+  `_transfer_line()`, `_extract_name()` / `_looks_like_name()` /
+  `_is_name_refusal()`; `start_transfer()` now asks for the name
+  first when it is unknown and `_do_transfer()` transfers with the
+  name in the line and the notification; the name is also asked
+  once, early, right after the greeting; two refusals/silences still
+  transfer, with the name "Naam dey ni".
 - `app/audio.py` — `mix_mulaw()` for the combined recording.
 - `app/store.py` — `conversation.wav` saved locally + uploaded to
   Supabase when configured; record carries
-  `recording_conversation_url` + `language`.
+  `recording_conversation_url` + `language`. **v2.1:**
+  `add_notification()` takes `caller_name`, so a transfer
+  notification shows WHO is calling.
 - `app/main.py` — `/health` reports `version:
-  2.0-dograh-patterns`; `/recordings/<id>/conversation.wav` served.
+  2.1-name-first-transfer`; `/recordings/<id>/conversation.wav` served.
 - `app/config.py` — `SARVAM_STT_MODEL` (default `saarika:v2.5`),
   `SARVAM_TTS_MODEL` (default `bulbul:v2`),
-  `SARVAM_STT_LANGUAGE` (default `bn-IN`).
+  `SARVAM_STT_LANGUAGE` (default `bn-IN`). **v2.1:** `NAME_ASK_BN`,
+  `NAME_BEFORE_TRANSFER_BN`, `NAME_RETRY_BN` (all Bengali, env-
+  overridable).
 - `static/call.html` — shows the turn state ("AI shunche / AI
   bolche...") from the server's `state` events. Browser STT/TTS
   were already `bn-IN` in v1 and are unchanged.
 - `tests/smoke_test_v2.py` — new: Bengali greeting + Bengali reply
   asserted (Bengali script), ambiguous-transfer confirmation flow,
   direct transfer + owner-busy timeout, goodbye ending,
-  conversation.wav, `/health` chains.
+  conversation.wav, `/health` chains. **v2.1:** name-before-transfer
+  (no name → ask → name → transfer with the name + notification
+  carries it), transfer with a name already known (at once, no name
+  question), name refused twice (still transfers, "Naam dey ni"),
+  early name ask after the greeting.
 - `tests/smoke_test.py` — updated only to skip v2 `state` events.
 - `.env.example` — new Sarvam model vars documented.
 
 Unchanged and still true: hard local mute on the user's phone
 (notification + recording only); calls answered by the server even
 when the user's phone has no internet; transfer only to Murshid /
-Sadhin (never "Sadik" — grep-verified zero matches); recordings
-never deleted by the server; Plivo adapter OFF by default.
+Sadhin; recordings never deleted by the server; Plivo adapter OFF
+by default.
 
 ## Run locally
 
@@ -189,7 +213,7 @@ scripted Bengali replies) works out of the box.
    (`dbibi698-commits/call-assistant-server`, branch `main`) —
    same Render Blueprint (`render.yaml`, free plan, unchanged).
 3. Render redeploys automatically; check `/health` shows
-   `version: 2.0-dograh-patterns`.
+   `version: 2.1-name-first-transfer`.
 4. Env vars on Render stay as they are today (only `OWNER_PHONE`
    is set). To get smart Bengali replies, set `GEMINI_API_KEY` in
    the Render dashboard (never in chat, never in code). For server

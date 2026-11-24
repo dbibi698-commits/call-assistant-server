@@ -72,14 +72,18 @@ def list_records() -> list[dict]:
         return sorted(_records.values(), key=lambda r: r["started_at"], reverse=True)
 
 
-def add_notification(kind: str, title: str, call_id: str = "", body: str = "") -> dict:
-    """A notification for the user's phone, e.g. 'Ei phone koreche'."""
+def add_notification(kind: str, title: str, call_id: str = "", body: str = "",
+                     caller_name: str = "") -> dict:
+    """A notification for the user's phone, e.g. 'Ei phone koreche'.
+    v2.1: a transfer notification carries the caller name, so the
+    phone alert can show WHO is calling."""
     note = {
         "id": uuid.uuid4().hex[:12],
         "kind": kind,  # 'call' | 'transfer'
         "title": title,
         "body": body,
         "call_id": call_id,
+        "caller_name": caller_name,
         "created_at": now_iso(),
         "read": False,
     }

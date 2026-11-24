@@ -81,11 +81,12 @@ def health():
     return {
         "ok": True,
         "service": "mith-hera-call-assistant-server",
-        "version": "2.0-dograh-patterns",
+        "version": "2.1-name-first-transfer",
         "pipeline": (
             "turn-state machine (greeting/listening/thinking/speaking), "
-            "barge-in guard 0.15s, transfer confirmation, combined "
-            "conversation.wav recording — patterns from Dograh "
+            "barge-in guard 0.15s, transfer confirmation, name-before-"
+            "transfer (AI takes the caller's name first, then transfers), "
+            "combined conversation.wav recording — patterns from Dograh "
             "(github.com/dograh-hq/dograh, BSD-2), reimplemented here "
             "in this lightweight server; Dograh itself is NOT running "
             "here (it needs 9 Docker services, far beyond Render free)"
@@ -188,8 +189,7 @@ async def _handle_ws(websocket: WebSocket, room_id: str | None, role: str):
                     start.get("from") or start.get("From") or "WebRTC caller"
                 )
                 if start.get("fromName"):
-                    session.caller_name = start["fromName"]
-                    session.record["from_name"] = start["fromName"]
+                    session._set_caller_name(start["fromName"])
                 session.caller_label = (
                     session.record["from_name"] or session.record["from_number"]
                 )
