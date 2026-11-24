@@ -103,6 +103,9 @@
 
   var ws = null, audioCtx = null, micStream = null, processor = null, source = null;
   var nextPlayTime = 0, serverStt = true, serverTts = true;
+  // v3: Pipecat sends clearAudio on barge-in — the sources scheduled
+  // ahead must be stopped, or the interrupted AI line keeps playing.
+  var playSources = [];
   var recog = null;
 
   fetch("/health").then(function (r) { return r.json(); }).then(function (h) {
@@ -156,6 +159,20 @@
     var t = Math.max(audioCtx.currentTime, nextPlayTime);
     src.start(t);
     nextPlayTime = t + pcm.length / 8000;
+    playSources.push(src);
+    src.onended = function () {
+      var i = playSources.indexOf(src);
+      if (i >= 0) playSources.splice(i, 1);
+    };
+  }
+
+  // v3 (Pipecat barge-in): stop every scheduled AI audio chunk and
+  // reset the playback clock, so an interrupted line never finishes.
+  function clearAudio() {
+    playSources.forEach(function (src) { try { src.stop(); } catch (e) {} });
+    playSources = [];
+    if (audioCtx) nextPlayTime = audioCtx.currentTime;
+    try { speechSynthesis.cancel(); } catch (e) {}
   }
 
   async function startCall() {
@@ -207,11 +224,14 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
       if (msg.event === "playAudio" && msg.media && msg.media.payload) {
         playMulaw(msg.media.payload);
+      } else if (msg.event === "clearAudio") {
+        clearAudio();
       } else if (msg.event === "say" && msg.text) {
         logLine("AI", msg.text);
         speakInBrowser(msg.text);
       } else if (msg.event === "state" && msg.state) {
-        // v2 turn-state machine: show what the AI is doing right now.
+        // v3 turn-state machine (Pipecat pipeline): show what the
+        // AI is doing right now.
         var stateText = {
           greeting: "AI greet korche...",
           listening: "AI shunche...",

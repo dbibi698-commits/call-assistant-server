@@ -3,3 +3,10 @@ uvicorn[standard]>=0.30
 websockets>=12
 requests>=2.32
 python-multipart>=0.0.9
+# v3: the real Pipecat pipeline (BSD-2) — STT -> LLM -> TTS engine,
+# with the Sarvam extra for Bengali STT/TTS (saaras:v4 / bulbul:v3).
+# Measured in this sandbox: ~142 MB RSS with both ONNX models
+# (Silero VAD + SmartTurn V3) — fits Render free (512 MB RAM).
+# Without it the server still runs: main.py falls back to the v2.1
+# CallSession loop.
+pipecat-ai[sarvam]==1.17.0

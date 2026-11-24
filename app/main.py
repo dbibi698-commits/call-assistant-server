@@ -9,8 +9,13 @@ is a transfer, and only when the caller asks for the owner.
 Run locally:
     pip install -r requirements.txt
     uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+v3: the caller leg runs on the real Pipecat pipeline (see
+app/pipecat_engine.py). If Pipecat cannot be imported, the v2.1
+CallSession loop below still answers calls exactly as before.
 """
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -26,6 +31,17 @@ from .config import settings
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mithhera.server")
+
+# v3 Pipecat engine — optional: if the import fails (pipecat not
+# installed), the v2.1 handler below keeps serving calls.
+try:
+    from . import pipecat_engine
+
+    PIPECAT_AVAILABLE = True
+except Exception as exc:  # noqa: BLE001 — any import failure = v2.1 mode
+    pipecat_engine = None  # type: ignore[assignment]
+    PIPECAT_AVAILABLE = False
+    log.warning("pipecat engine unavailable, v2.1 handler in use: %s", exc)
 
 app = FastAPI(title="Mith Hera Call Assistant Server")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
@@ -81,15 +97,22 @@ def health():
     return {
         "ok": True,
         "service": "mith-hera-call-assistant-server",
-        "version": "2.1-name-first-transfer",
+        "version": "3.0-pipecat",
         "pipeline": (
-            "turn-state machine (greeting/listening/thinking/speaking), "
-            "barge-in guard 0.15s, transfer confirmation, name-before-"
-            "transfer (AI takes the caller's name first, then transfers), "
-            "combined conversation.wav recording — patterns from Dograh "
-            "(github.com/dograh-hq/dograh, BSD-2), reimplemented here "
-            "in this lightweight server; Dograh itself is NOT running "
-            "here (it needs 9 Docker services, far beyond Render free)"
+            "Pipecat pipeline (pipecat-ai, BSD-2): FastAPI WebSocket "
+            "transport (mu-law 8 kHz) -> BridgeProcessor -> Sarvam STT "
+            "or browser STT -> user aggregator (Silero VAD + SmartTurn "
+            "V3 default stop strategy, barge-in) -> ConversationProcessor "
+            "(greeting, name-before-transfer, transfer confirm, goodbye) "
+            "-> Gemini or scripted Bengali LLM -> Sarvam Bulbul TTS or "
+            "browser TTS -> TapProcessor (recording) -> transport. "
+            "The v2.1 CallSession loop stays as the fallback when "
+            "Pipecat is unavailable."
+        ),
+        "pipecat": (
+            pipecat_engine.engine_info()
+            if PIPECAT_AVAILABLE
+            else {"engine": "v2.1-fallback", "reason": "pipecat not installed"}
         ),
         "ai": ai.status(),
         "supabase": store.supabase_configured(),
@@ -235,26 +258,120 @@ async def _handle_ws(websocket: WebSocket, room_id: str | None, role: str):
                 if session.bridged:
                     session.bridged = False
                     # Owner left mid-transfer: AI resumes politely.
-                    import asyncio
-
-                    asyncio.create_task(
-                        session.speak("Owner call theke beriye gechen. Ami abar achi, bolun.")
-                    )
+                    # v3: through the pipeline (the transport owns the
+                    # caller socket); v2.1: raw speak, as before.
+                    if session.pipecat_mode and PIPECAT_AVAILABLE:
+                        asyncio.create_task(pipecat_engine.owner_left(session))
+                    else:
+                        asyncio.create_task(
+                            session.speak("Owner call theke beriye gechen. Ami abar achi, bolun.")
+                        )
             elif role == "caller" and session.caller_ws is websocket:
                 session.caller_ws = None
                 await session.finalize()
 
 
+# --------------------------------------------------- websocket (v3 Pipecat)
+async def _v21_caller_loop(websocket: WebSocket, session: call_session.CallSession):
+    """The v2.1 caller loop, for a session whose "start" was already
+    consumed. Used ONLY when the Pipecat pipeline failed before it
+    started (the transport never read a message yet, so the v2.1
+    loop can safely take the same socket over)."""
+    session.pipecat_mode = False
+    await session.greet()
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            event = msg.get("event")
+            if event == "media":
+                payload = (msg.get("media") or {}).get("payload", "")
+                if payload:
+                    try:
+                        await session.on_caller_audio(base64.b64decode(payload))
+                    except Exception:
+                        continue
+            elif event == "transcript":
+                await session.on_caller_text((msg.get("text") or "").strip())
+            elif event == "stop":
+                await session.end("caller-ended")
+                break
+    except WebSocketDisconnect:
+        pass
+
+
+async def _handle_ws_pipecat(websocket: WebSocket, room_id: str | None):
+    """Caller leg on the Pipecat pipeline (v3). Reads "start", then
+    hands the socket to the engine. The owner leg still goes through
+    _handle_ws (role=owner) — the owner socket is raw, the engine
+    reaches it through the session's owner_audio_queue."""
+    await websocket.accept()
+    session: call_session.CallSession | None = None
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if msg.get("event") == "start":
+                start = msg.get("start", {}) or {}
+                rid = room_id or start.get("callId") or store.new_call_id()
+                session = call_session.get_or_create_session(rid)
+                session.record["from_number"] = (
+                    start.get("from") or start.get("From") or "WebRTC caller"
+                )
+                if start.get("fromName"):
+                    session._set_caller_name(start["fromName"])
+                session.caller_label = (
+                    session.record["from_name"] or session.record["from_number"]
+                )
+                mode = (start.get("customParameters") or {}).get("mode") or start.get("mode")
+                session.caller_ws = websocket
+                if mode == "ownerbusy":
+                    # Owner-busy mode (Plivo after-stream path): speak
+                    # the busy line, then end — no pipeline needed.
+                    await session.speak(settings.BUSY_LINE_BN)
+                    await session.end("owner-busy")
+                else:
+                    try:
+                        await pipecat_engine.run_call(websocket, session, rid)
+                    except pipecat_engine.EngineNotStarted:
+                        log.warning(
+                            "pipecat did not start for %s, v2.1 fallback", rid
+                        )
+                        await _v21_caller_loop(websocket, session)
+                return
+            # Any pre-start event is dropped.
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.warning("WS pipecat error: %s", exc)
+    finally:
+        if session:
+            session.caller_ws = None
+            await session.finalize()
+
+
 @app.websocket("/ws/call/{room_id}")
 async def ws_call(websocket: WebSocket, room_id: str):
     role = websocket.query_params.get("role", "caller")
-    await _handle_ws(websocket, room_id, role)
+    if role == "caller" and PIPECAT_AVAILABLE:
+        await _handle_ws_pipecat(websocket, room_id)
+    else:
+        await _handle_ws(websocket, room_id, role)
 
 
 @app.websocket("/media-stream")
 async def ws_media_stream(websocket: WebSocket):
     """Same engine, Plivo-compatible path (optional provider adapter)."""
-    await _handle_ws(websocket, None, "caller")
+    if PIPECAT_AVAILABLE:
+        await _handle_ws_pipecat(websocket, None)
+    else:
+        await _handle_ws(websocket, None, "caller")
 
 
 # ------------------------------------------- OPTIONAL provider adapter ----

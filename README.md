@@ -1,22 +1,48 @@
-# Mith Hera Call Assistant — Server v2.1 (name-first transfer)
+# Mith Hera Call Assistant — Server v3 (Pipecat engine)
 
 Own free server. **No Plivo, no Twilio, no paid telephony provider.**
 Calls come in over the internet (WebRTC page) straight to this server.
 The server AI answers in Bengali, listens, replies, records both sides.
 The user's phone stays silent — only a notification + a recording.
 
-**Status: v2.1 built and locally verified. NOT deployed.** The live
-server (https://mith-hera-call-server.onrender.com) still runs v2
+**Status: v3 built and locally verified. NOT deployed.** The live
+server (https://mith-hera-call-server.onrender.com) still runs v2.1
 until the user approves this version. Nothing was pushed to the live
 repo.
 
-**v2.1 change:** the AI takes the caller's name FIRST, then
-transfers — a caller who asks for Murshid/Sadhin is asked
-"ট্রান্সফার করার আগে আপনার নামটা বলুন?" and the transfer line
-becomes "এক মিনিট, <name> — কানেক্ট করছি।"; the transfer
-notification carries the name so the phone alert shows WHO is
-calling. Refusing the name twice still transfers ("Naam dey ni").
-The name is also asked once, early, after the greeting.
+**v3 change:** the caller leg now runs on the REAL Pipecat pipeline
+(pipecat-ai 1.17.0, BSD-2) — the most popular open-source voice-agent
+framework, and the engine Dograh itself is built on. Same wire
+protocol as v2.1 (same /health + /calls + /notifications API shape,
+same /call page, same mu-law 8 kHz WebSocket), so the v1.6.1 app
+keeps working unchanged. What Pipecat adds: a real VAD (Silero) +
+SmartTurn V3 turn-taking (Pipecat's default stop strategy) so the AI
+stops cutting the caller off, barge-in (the caller can interrupt the
+AI and the interrupted audio is cleared with `clearAudio`), a proper
+LLM context aggregator, and a Plivo serializer that speaks exactly
+the wire format this server already used. The v2.1 CallSession loop
+stays in the code as the fallback if Pipecat cannot be imported.
+
+**v3 behaviour changes vs v2.1 (honest):**
+* The keyed LLM is a SINGLE model now — gemini-3.5-flash through
+  Gemini's OpenAI-compatible endpoint. The 3-model fallback chain
+  (3.5-flash → 3.5-flash-lite → flash-latest) still exists in the
+  v2.1 fallback engine (app/ai.py), not in the Pipecat LLM service.
+  If the single model errors, the pipeline says a scripted Bengali
+  line instead of going silent.
+* The keyed STT/TTS are the Pipecat Sarvam STREAMING services:
+  STT saaras:v4 (bn-IN), TTS bulbul:v3, voice roopa (bn-IN).
+  The env vars SARVAM_STT_MODEL / SARVAM_TTS_MODEL are honoured
+  only when they name a streaming model (saaras:* / bulbul:v3 or
+  bulbul:v4-flash); the v2.1 defaults (saarika:v2.5 / bulbul:v2)
+  are HTTP models and are used only by the v2.1 fallback engine
+  and the /voice/greeting test endpoint, not by the pipeline.
+  GOOGLE_API_KEY (Google Cloud STT/TTS) is likewise only used by
+  the v2.1 fallback engine — the Pipecat pipeline's keyed chain is
+  Sarvam only, browser STT/TTS otherwise.
+* With NO keys set, v3 works exactly like v2.1 did: browser STT
+  (bn-IN) + scripted Bengali replies + browser TTS (bn-IN) — free
+  forever, never English, never silent.
 
 ## Sotti kotha / Honest limit (please read first)
 
@@ -114,6 +140,22 @@ into this repo; the patterns below were reimplemented from scratch.
 **Language: bn-IN everywhere.** The greeting, every reply, the
 system prompt, the summary and the notifications are Bengali.
 
+**v3 — the Pipecat pipeline chains** (what actually runs on a call;
+`/health` → `pipecat` block reports them live):
+
+| Layer | Keyed (needs key) | No key (free) |
+|---|---|---|
+| Brain | Gemini **gemini-3.5-flash** via the OpenAI-compatible endpoint, `system_instruction=SYSTEM_PROMPT_BN` (Bengali) | Scripted Bengali replies (`ScriptedLLMProcessor` → `ai.brain_reply`) |
+| STT | **Sarvam Saarika streaming `saaras:v4`, bn-IN** (`SarvamSTTService`) | Caller browser STT (`webkitSpeechRecognition`, `lang=bn-IN`) injected as `TranscriptionFrame` by the serializer |
+| TTS | **Sarvam Bulbul streaming `bulbul:v3`, voice `roopa`, bn-IN** (`SarvamTTSService`) | Caller browser speech synthesis (`lang=bn-IN`) via `{"event": "say"}` |
+| Turn-taking | **Silero VAD + SmartTurn V3** (Pipecat's default stop strategy) + barge-in via `InterruptionFrame` + `clearAudio` | Same — turn-taking needs no key |
+
+The table below is the **v2.1 fallback engine** (app/ai.py), which
+still runs when Pipecat cannot be imported, and which also powers
+the `/voice/greeting` test endpoint. Its chains are NOT the
+pipeline's: Google Cloud STT/TTS and the 3-model Gemini chain exist
+only there.
+
 | Layer | Primary | Fallback | Needs a key? |
 |---|---|---|---|
 | Brain | Gemini, **system prompt in Bengali** (`SYSTEM_PROMPT_BN` in `app/ai.py`) — model must reply in natural Bengali, never English, end every turn with a question | Scripted Bengali replies (`SCRIPTED_ACK`) | Gemini: yes, `GEMINI_API_KEY`. Scripted: no |
@@ -186,10 +228,50 @@ when the user's phone has no internet; transfer only to Murshid /
 Sadhin; recordings never deleted by the server; Plivo adapter OFF
 by default.
 
+## What v3 changed vs v2.1 (file list)
+
+- `app/pipecat_engine.py` — NEW. The real Pipecat pipeline:
+  `MithHeraSerializer` (Plivo wire format + `transcript` →
+  `TranscriptionFrame`, `stop` → `EndFrame`, `auto_hang_up=False`);
+  `BridgeProcessor` (records caller audio, forwards it to the owner
+  while bridged, pumps owner audio downstream as
+  `OutputAudioRawFrame`); `TapProcessor` (records AI + owner audio
+  right before the output); `BrowserTTSProcessor` (no-key TTS →
+  `{"event": "say"}`); `ScriptedLLMProcessor` (no-key LLM →
+  `ai.brain_reply`, full-response frames); `ConversationProcessor`
+  (greeting, name-before-transfer, transfer confirm, goodbye —
+  decisions reuse the v2.1 helpers from `call_session.py`, so they
+  cannot drift); `CallEngine` (one `WorkerRunner` per call,
+  `idle_timeout_secs=None` — the AI never ends a call itself;
+  transfer wait + end scheduling); `engine_info()` for `/health`.
+- `app/call_session.py` — v3 hooks only: `owner_audio_queue`,
+  `notify_fn` (events through the pipeline, never a raw send),
+  `pipecat_mode` (owner audio routed to the queue), `_end_reason` /
+  `_end_sent`, `_last_handled_text`, `_pipecat_engine`;
+  `on_owner_audio()` routes to the queue in pipecat mode;
+  `owner_joined()` cancels a running transfer wait. The v2.1 loop
+  is otherwise untouched and stays the fallback.
+- `app/main.py` — lazy Pipecat import (`PIPECAT_AVAILABLE`; the
+  server still starts without pipecat); `/health` version
+  `3.0-pipecat` + `pipecat` engine block; `_handle_ws_pipecat()`
+  (caller leg → engine, `EngineNotStarted` → `_v21_caller_loop`
+  fallback on the same socket); owner-left goes through the engine
+  (`pipecat_engine.owner_left`) in pipecat mode.
+- `requirements.txt` — `pipecat-ai[sarvam]==1.17.0` added.
+  Measured: ~142 MB RSS with both ONNX models, ~135 MB for the
+  running server process — fits Render free (512 MB RAM).
+- `static/call.html` — `clearAudio` handling (stops scheduled AI
+  audio + browser speech on barge-in).
+- `tests/smoke_test_v3.py` — NEW: all v2 wire tests on the Pipecat
+  pipeline + a bridged-audio test (owner audio → caller as
+  `playAudio`, caller audio → owner as `playAudio`, both legs
+  recorded with real audio in the WAVs) + `/health` pipecat block.
+- `.gitignore` — `recordings-test-v3/` added.
+
 ## Run locally
 
 ```bash
-cd call-assistant-server-v2
+cd call-assistant-server-v3
 python3 -m venv .venv        # only if .venv is not already here
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -199,21 +281,23 @@ python3 -m venv .venv        # only if .venv is not already here
 No keys needed to try it: the no-key path (browser STT/TTS +
 scripted Bengali replies) works out of the box.
 
-## Tests (both suites pass)
+## Tests (all suites pass)
 
 ```bash
 .venv/bin/python tests/smoke_test.py      # v1 suite, v2-compatible
 .venv/bin/python tests/smoke_test_v2.py   # v2: Bengali, transfer, goodbye
+.venv/bin/python tests/smoke_test_v3.py   # v3: same wire tests on the
+                                          # Pipecat pipeline + bridged audio
 ```
 
 ## Deploy (ONLY after the user approves)
 
 1. User approves this version in chat.
-2. Copy the v2 files over the live repo
+2. Copy the v3 files over the live repo
    (`dbibi698-commits/call-assistant-server`, branch `main`) —
    same Render Blueprint (`render.yaml`, free plan, unchanged).
 3. Render redeploys automatically; check `/health` shows
-   `version: 2.1-name-first-transfer`.
+   `version: 3.0-pipecat` and `pipecat.engine == "pipecat".
 4. Env vars on Render stay as they are today (only `OWNER_PHONE`
    is set). To get smart Bengali replies, set `GEMINI_API_KEY` in
    the Render dashboard (never in chat, never in code). For server

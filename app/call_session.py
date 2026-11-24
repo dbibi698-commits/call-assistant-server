@@ -236,6 +236,25 @@ class CallSession:
         self.transfer_status = ""          # "" | "waiting" | "bridged" | "timeout"
         self.bridged = False
         self._empty_heard = 0
+        # v3 (Pipecat engine) hooks — only used when the call runs on the
+        # Pipecat pipeline instead of the v2.1 CallSession loop:
+        # owner_audio_queue carries owner mu-law frames to the pipeline's
+        # bridge processor; notify_fn sends a JSON event to the caller
+        # THROUGH the pipeline (never a raw socket send while the
+        # Pipecat transport owns the caller websocket); pipecat_mode
+        # tells the raw handlers (main.py) to route owner audio to the
+        # queue instead of forwarding it themselves.
+        self.owner_audio_queue: asyncio.Queue = asyncio.Queue()
+        self._transfer_wait_task: asyncio.Task | None = None
+        self.notify_fn = None
+        self.pipecat_mode = False
+        self._end_reason = ""
+        self._end_sent = False
+        # Last caller utterance the Pipecat conversation processor
+        # already answered (LLMRunFrame safety-net dedup) and the
+        # running engine instance (for the owner-left callback).
+        self._last_handled_text = ""
+        self._pipecat_engine = None
         # v2 turn-state machine (Dograh pipeline pattern).
         self.state = STATE_LISTENING
         self._interrupt_since: float | None = None
@@ -283,6 +302,12 @@ class CallSession:
                 log.debug("send failed: %s", exc)
 
     async def send_caller(self, msg: dict):
+        # v3: while the Pipecat transport owns the caller websocket, the
+        # engine sets notify_fn so events go through the pipeline
+        # (OutputTransportMessageFrame) instead of a raw socket send.
+        if self.notify_fn is not None:
+            await self.notify_fn(msg)
+            return
         await self._send(self.caller_ws, msg)
 
     async def send_owner(self, msg: dict):
@@ -584,6 +609,11 @@ class CallSession:
             await self.end("owner-busy")
 
     async def owner_joined(self):
+        # A transfer wait running in the v3 engine is cancelled the
+        # moment the owner joins (the engine stores it here).
+        if self._transfer_wait_task is not None and not self._transfer_wait_task.done():
+            self._transfer_wait_task.cancel()
+            self._transfer_wait_task = None
         self.bridged = True
         self.transfer_status = "bridged"
         self.record["transferred"] = True
@@ -595,6 +625,15 @@ class CallSession:
         )
 
     async def on_owner_audio(self, mulaw: bytes):
+        # v3: the Pipecat pipeline owns the caller leg — owner audio
+        # goes into the bridge processor's queue (it is pumped
+        # downstream as OutputAudioRawFrame, so the caller hears it
+        # AND the TapProcessor records it). Do NOT append it here
+        # or forward it raw: that would double-record it and fight
+        # the transport for the caller socket.
+        if self.pipecat_mode:
+            await self.owner_audio_queue.put(bytes(mulaw))
+            return
         self.outbound_mulaw += mulaw
         if self.bridged:
             await self.send_caller(
